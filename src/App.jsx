@@ -27,6 +27,8 @@ export default function App() {
     objectId: null,
   })
 
+  const [retryCount, setRetryCount] = useState(0)
+
   function handleModeChange(newMode) {
     setMode(newMode)
     try {
@@ -34,6 +36,10 @@ export default function App() {
     } catch {
       // ignore
     }
+  }
+
+  function handleRetry() {
+    setRetryCount((c) => c + 1)
   }
 
   const selected = useMemo(() => {
@@ -80,7 +86,7 @@ export default function App() {
       })
 
     return () => controller.abort()
-  }, [selected])
+  }, [selected, retryCount])
 
   function handleSelectTarget(targetId) {
     setSelectedId(targetId)
@@ -120,6 +126,8 @@ export default function App() {
               onSelectTarget={handleSelectTarget}
               archiveData={archive.objectId === selected?.id ? archive.data : null}
               archiveStatus={archive.objectId === selected?.id ? archive.status : 'loading'}
+              archiveError={archive.objectId === selected?.id ? archive.error : null}
+              onRetry={handleRetry}
               mode={mode}
             />
           </div>

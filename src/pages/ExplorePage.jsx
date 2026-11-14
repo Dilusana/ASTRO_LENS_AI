@@ -20,7 +20,9 @@ export default function ExplorePage({
   selectedId,
   onSelectTarget,
   archiveData,
-  archiveStatus: _archiveStatus,
+  archiveStatus = 'idle',
+  archiveError = null,
+  onRetry,
   mode = 'explorer',
 }) {
   const [searchQuery, setSearchQuery] = useState('')
@@ -376,14 +378,44 @@ export default function ExplorePage({
           </span>
         </div>
 
-        {/* Real SPHEREx Time Machine Component */}
-        <SkyTimeMachine
-          observations={archiveData?.observations || []}
-          queryRa={archiveData?.query?.ra_deg}
-          queryDec={archiveData?.query?.dec_deg}
-          comparable={archiveData?.comparable}
-          mode={mode}
-        />
+        {/* Real SPHEREx Time Machine Component / Loading / Error States */}
+        {archiveStatus === 'loading' ? (
+          <div className="rounded-2xl border border-purple-500/30 bg-panel/70 p-8 text-center space-y-4 shadow-xl backdrop-blur-sm">
+            <div className="inline-flex h-12 w-12 items-center justify-center rounded-full border border-purple-400 bg-purple-950/40 text-purple-300 shadow-[0_0_20px_rgba(168,85,247,0.4)] animate-spin">
+              <span className="text-xl">🪐</span>
+            </div>
+            <div className="space-y-1">
+              <p className="text-sm font-semibold text-white">
+                Querying NASA/IPAC IRSA SPHEREx Archives...
+              </p>
+              <p className="text-xs text-muted max-w-md mx-auto leading-relaxed">
+                Retrieving authentic Level-2 spectral images and astrometric coordinates for <strong className="text-cyan-300">{activeObject?.name}</strong> from Caltech IRSA Simple Image Access (SIA2).
+              </p>
+            </div>
+          </div>
+        ) : archiveStatus === 'error' ? (
+          <div className="rounded-2xl border border-red-500/40 bg-red-950/20 p-6 text-center space-y-3">
+            <p className="text-sm font-bold text-red-200">NASA Archive Query Failed</p>
+            <p className="text-xs text-slate-300 max-w-md mx-auto">{archiveError || 'Could not retrieve SPHEREx images for this target.'}</p>
+            {onRetry && (
+              <button
+                type="button"
+                onClick={onRetry}
+                className="cursor-pointer rounded-full border border-red-400/50 bg-red-500/20 px-4 py-1.5 text-xs font-semibold text-red-200 hover:bg-red-500/30 transition shadow-sm"
+              >
+                Retry NASA Query
+              </button>
+            )}
+          </div>
+        ) : (
+          <SkyTimeMachine
+            observations={archiveData?.observations || []}
+            queryRa={archiveData?.query?.ra_deg}
+            queryDec={archiveData?.query?.dec_deg}
+            comparable={archiveData?.comparable}
+            mode={mode}
+          />
+        )}
       </section>
 
       {/* 5. Curated Sky Tours */}
