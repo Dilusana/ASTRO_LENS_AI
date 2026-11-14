@@ -19,3 +19,29 @@ export async function fetchSpherexObservations({ raDeg, decDeg }, signal) {
   }
   return body
 }
+
+export async function fetchSpherexCompare({ fitsUrl1, fitsUrl2, ra, dec, sizeDeg = 0.04, interpolation = 'nearest' }, signal) {
+  const params = new URLSearchParams({
+    fits_url_1: fitsUrl1,
+    fits_url_2: fitsUrl2,
+    ra: String(ra),
+    dec: String(dec),
+    size_deg: String(sizeDeg),
+    interpolation: String(interpolation),
+  })
+  const response = await fetch(`/api/spherex/compare?${params}`, { signal })
+  let body = null
+  try {
+    body = await response.json()
+  } catch {
+    body = null
+  }
+  if (!response.ok) {
+    const detail = body && typeof body.detail === 'string' ? body.detail : null
+    throw new Error(detail || 'The multi-epoch comparison request failed.')
+  }
+  if (!body || !body.epoch1 || !body.epoch2 || !body.registration) {
+    throw new Error('The comparison service returned an invalid registration structure.')
+  }
+  return body
+}

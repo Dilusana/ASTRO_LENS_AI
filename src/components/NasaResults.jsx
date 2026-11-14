@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import SkyTimeMachine from './SkyTimeMachine'
 
 function formatWavelength(min, max) {
   if (min == null || max == null) return 'Not in archive row'
@@ -604,6 +605,17 @@ export default function NasaResults({ objectName, status, result, error, onRetry
 
           {/* Repeat Coverage & Caution Section */}
           <RepeatCoverage comparable={result.comparable} mode={mode} />
+
+          {/* Multi-Epoch Sky Time Machine Comparison */}
+          {result.count >= 1 && (
+            <SkyTimeMachine
+              observations={result.observations}
+              queryRa={result.query.ra_deg}
+              queryDec={result.query.dec_deg}
+              comparable={result.comparable}
+              mode={mode}
+            />
+          )}
 
           {/* Observation List */}
           <div className="mt-6">

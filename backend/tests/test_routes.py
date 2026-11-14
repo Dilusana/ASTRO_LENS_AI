@@ -11,7 +11,7 @@ import pytest
 from unittest.mock import patch
 from fastapi import HTTPException
 
-from app.main import spherex_observations, spherex_preview, spherex_preview_meta
+from app.main import spherex_observations, spherex_preview, spherex_preview_meta, spherex_compare
 from app.spherex import SpherexError
 from app.fits_service import FitsServiceError
 
@@ -349,4 +349,48 @@ def test_spherex_preview_meta_success():
     assert meta["obs_id"] == "MOCK_OBS_01"
     assert meta["bunit"] == "MJy / sr"
     assert meta["inside_footprint"] is True
+
+
+def test_spherex_compare_success():
+    mock_compare_result = {
+        "epoch1": {"obs_id": "EPOCH_1"},
+        "epoch2": {"obs_id": "EPOCH_2"},
+        "registration": {"status": "aligned", "warnings": []},
+    }
+
+    async def _mock_compare(*args, **kwargs):
+        return mock_compare_result
+
+    async def _run():
+        with patch("app.main.compare_two_epochs", side_effect=_mock_compare):
+            return await spherex_compare(
+                fits_url_1="https://irsa.ipac.caltech.edu/ibe/data/spherex/epoch1.fits",
+                fits_url_2="https://irsa.ipac.caltech.edu/ibe/data/spherex/epoch2.fits",
+                ra=10.0,
+                dec=41.0,
+            )
+
+    result = asyncio.run(_run())
+    assert result["epoch1"]["obs_id"] == "EPOCH_1"
+    assert result["registration"]["status"] == "aligned"
+
+
+def test_spherex_compare_error():
+    async def _mock_compare(*args, **kwargs):
+        raise FitsServiceError("Reprojection failed", status_code=502)
+
+    async def _run():
+        with patch("app.main.compare_two_epochs", side_effect=_mock_compare):
+            return await spherex_compare(
+                fits_url_1="https://irsa.ipac.caltech.edu/ibe/data/spherex/epoch1.fits",
+                fits_url_2="https://irsa.ipac.caltech.edu/ibe/data/spherex/epoch2.fits",
+                ra=10.0,
+                dec=41.0,
+            )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_run())
+    assert exc.value.status_code == 502
+    assert "Reprojection failed" in exc.value.detail
+
 

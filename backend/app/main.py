@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
+from .compare_service import compare_two_epochs
 from .fits_service import FitsServiceError, get_or_render_preview
 from .spherex import SpherexError, search_observations
 
@@ -12,6 +13,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
     ],
     allow_methods=["GET"],
     allow_headers=["*"],
@@ -72,5 +75,22 @@ async def spherex_preview_meta(
     try:
         _, metadata = await get_or_render_preview(fits_url, ra, dec, s_deg)
         return metadata
+    except FitsServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/spherex/compare")
+async def spherex_compare(
+    fits_url_1: str = Query(..., description="First epoch NASA IRSA FITS URL"),
+    fits_url_2: str = Query(..., description="Second epoch NASA IRSA FITS URL"),
+    ra: float = Query(..., ge=0, lt=360, description="Right ascension in ICRS degrees"),
+    dec: float = Query(..., ge=-90, le=90, description="Declination in ICRS degrees"),
+    size_deg: float = Query(0.04, gt=0, le=0.2, description="Cutout field-of-view size in degrees"),
+    interpolation: str = Query("nearest", pattern="^(nearest|bilinear)$", description="Display interpolation method"),
+) -> dict:
+    s_deg = size_deg.default if hasattr(size_deg, "default") else size_deg
+    interp = interpolation.default if hasattr(interpolation, "default") else interpolation
+    try:
+        return await compare_two_epochs(fits_url_1, fits_url_2, ra, dec, s_deg, interpolation=interp)
     except FitsServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
