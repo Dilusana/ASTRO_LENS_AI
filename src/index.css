@@ -1,0 +1,42 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Outfit', ui-sans-serif, system-ui, sans-serif;
+  --font-display: 'Instrument Serif', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --color-void: #070b14;
+  --color-panel: #10192a;
+  --color-ink: #e8eef8;
+  --color-muted: #8ea0bb;
+  --color-line: rgb(186 210 255 / 0.16);
+  --color-brass: #e4c27a;
+  --color-glint: #9fd7ff;
+}
+
+html {
+  background: var(--color-void);
+}
+
+body {
+  margin: 0;
+  min-height: 100svh;
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  background:
+    radial-gradient(circle at 12% 8%, rgb(159 215 255 / 0.08), transparent 26%),
+    radial-gradient(circle at 88% 0%, rgb(228 194 122 / 0.08), transparent 22%),
+    radial-gradient(1px 1px at 8% 18%, rgb(255 255 255 / 0.55), transparent),
+    radial-gradient(1px 1px at 22% 72%, rgb(255 255 255 / 0.4), transparent),
+    radial-gradient(1px 1px at 68% 24%, rgb(255 255 255 / 0.45), transparent),
+    radial-gradient(1px 1px at 84% 64%, rgb(255 255 255 / 0.35), transparent),
+    radial-gradient(1px 1px at 46% 40%, rgb(255 255 255 / 0.3), transparent),
+    var(--color-void);
+}
+
+#root {
+  min-height: 100svh;
+}
+
+.font-display {
+  font-family: var(--font-display);
+}
