@@ -126,6 +126,11 @@ def _observation(row: dict[str, str], ra: float, dec: float) -> dict:
         "cutout_url": _cutout_url(access_url, ra, dec),
         "publisher_did": _blank_to_none(row.get("obs_publisher_did")),
         "preview_image_url": None,
+        "fits_preview_url": (
+            f"/api/spherex/preview?fits_url={access_url}&ra={ra:.8f}&dec={dec:.8f}"
+            if access_url
+            else None
+        ),
         "preview_note": PREVIEW_NOTE,
     }
 

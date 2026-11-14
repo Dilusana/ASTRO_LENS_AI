@@ -11,8 +11,9 @@ import pytest
 from unittest.mock import patch
 from fastapi import HTTPException
 
-from app.main import spherex_observations
+from app.main import spherex_observations, spherex_preview, spherex_preview_meta
 from app.spherex import SpherexError
+from app.fits_service import FitsServiceError
 
 
 # ── shared mock data ───────────────────────────────────────────────────────────
@@ -282,3 +283,70 @@ def test_default_radius_and_max_records():
     asyncio.run(_run())
     assert received["radius_deg"] == pytest.approx(0.01)
     assert received["max_records"] == 80
+
+
+# ── /api/spherex/preview tests ──────────────────────────────────────────────────
+
+MOCK_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x00\x00\x00\x00:~\x9bU\x00\x00\x00\nIDATx\x9cc`\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+MOCK_META = {
+    "dimensions": [23, 23],
+    "bunit": "MJy / sr",
+    "obs_id": "MOCK_OBS_01",
+    "inside_footprint": True,
+}
+
+
+def test_spherex_preview_success():
+    async def _mock_render(*args, **kwargs):
+        return MOCK_PNG, MOCK_META
+
+    async def _run():
+        with patch("app.main.get_or_render_preview", side_effect=_mock_render):
+            return await spherex_preview(
+                fits_url="https://irsa.ipac.caltech.edu/ibe/data/spherex/test.fits",
+                ra=10.0,
+                dec=41.0,
+            )
+
+    resp = asyncio.run(_run())
+    assert resp.media_type == "image/png"
+    assert resp.body == MOCK_PNG
+    assert resp.headers["X-Fits-Obs-Id"] == "MOCK_OBS_01"
+    assert resp.headers["X-Fits-Inside-Footprint"] == "true"
+
+
+def test_spherex_preview_error_raises_http():
+    async def _mock_render(*args, **kwargs):
+        raise FitsServiceError("FITS service failed", status_code=502)
+
+    async def _run():
+        with patch("app.main.get_or_render_preview", side_effect=_mock_render):
+            return await spherex_preview(
+                fits_url="https://irsa.ipac.caltech.edu/ibe/data/spherex/test.fits",
+                ra=10.0,
+                dec=41.0,
+            )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_run())
+    assert exc.value.status_code == 502
+    assert "FITS service failed" in exc.value.detail
+
+
+def test_spherex_preview_meta_success():
+    async def _mock_render(*args, **kwargs):
+        return MOCK_PNG, MOCK_META
+
+    async def _run():
+        with patch("app.main.get_or_render_preview", side_effect=_mock_render):
+            return await spherex_preview_meta(
+                fits_url="https://irsa.ipac.caltech.edu/ibe/data/spherex/test.fits",
+                ra=10.0,
+                dec=41.0,
+            )
+
+    meta = asyncio.run(_run())
+    assert meta["obs_id"] == "MOCK_OBS_01"
+    assert meta["bunit"] == "MJy / sr"
+    assert meta["inside_footprint"] is True
+

@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 
+from .fits_service import FitsServiceError, get_or_render_preview
 from .spherex import SpherexError, search_observations
 
 app = FastAPI(title="AstroLens X SPHEREx API", version="0.1.0")
@@ -33,4 +35,42 @@ async def spherex_observations(
     try:
         return await search_observations(ra, dec, rad, max_rec)
     except SpherexError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/spherex/preview")
+async def spherex_preview(
+    fits_url: str = Query(..., description="NASA IRSA SPHEREx FITS URL"),
+    ra: float = Query(..., ge=0, lt=360, description="Right ascension in ICRS degrees"),
+    dec: float = Query(..., ge=-90, le=90, description="Declination in ICRS degrees"),
+    size_deg: float = Query(0.04, gt=0, le=0.1, description="Cutout size in degrees"),
+) -> Response:
+    s_deg = size_deg.default if hasattr(size_deg, "default") else size_deg
+    try:
+        png_bytes, metadata = await get_or_render_preview(fits_url, ra, dec, s_deg)
+        headers = {
+            "Content-Type": "image/png",
+            "Cache-Control": "public, max-age=86400",
+            "X-Fits-Obs-Id": str(metadata.get("obs_id", "")),
+            "X-Fits-BUnit": str(metadata.get("bunit", "")),
+            "X-Fits-Inside-Footprint": str(metadata.get("inside_footprint", False)).lower(),
+            "X-Fits-Dimensions": f"{metadata['dimensions'][0]}x{metadata['dimensions'][1]}",
+        }
+        return Response(content=png_bytes, media_type="image/png", headers=headers)
+    except FitsServiceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.get("/api/spherex/preview_meta")
+async def spherex_preview_meta(
+    fits_url: str = Query(..., description="NASA IRSA SPHEREx FITS URL"),
+    ra: float = Query(..., ge=0, lt=360, description="Right ascension in ICRS degrees"),
+    dec: float = Query(..., ge=-90, le=90, description="Declination in ICRS degrees"),
+    size_deg: float = Query(0.04, gt=0, le=0.1, description="Cutout size in degrees"),
+) -> dict:
+    s_deg = size_deg.default if hasattr(size_deg, "default") else size_deg
+    try:
+        _, metadata = await get_or_render_preview(fits_url, ra, dec, s_deg)
+        return metadata
+    except FitsServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
