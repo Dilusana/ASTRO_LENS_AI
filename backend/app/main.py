@@ -28,7 +28,9 @@ async def spherex_observations(
     radius_deg: float = Query(0.01, gt=0, le=0.05),
     max_records: int = Query(80, ge=1, le=150),
 ) -> dict:
+    rad = radius_deg.default if hasattr(radius_deg, "default") else radius_deg
+    max_rec = max_records.default if hasattr(max_records, "default") else max_records
     try:
-        return await search_observations(ra, dec, radius_deg, max_records)
+        return await search_observations(ra, dec, rad, max_rec)
     except SpherexError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
