@@ -52,11 +52,14 @@ export default function AstroAiPage({
   const activeTargetName = selectedObject?.name || 'Betelgeuse'
 
   const starterQuestions = [
-    { label: 'What is this star?', query: `Tell me about ${activeTargetName} and what kind of celestial object it is.` },
+    { label: 'What is this star?', query: `What is this star (${activeTargetName}) and what kind of celestial object is it?` },
     { label: 'How far away is it?', query: `How far away is ${activeTargetName} from Earth, and how do astronomers measure cosmic distances?` },
-    { label: 'Why does space change?', query: 'Why does space change over time, and how do multi-epoch infrared surveys spot movement?' },
-    { label: 'What am I seeing in this NASA image?', query: 'What am I seeing in this NASA SPHEREx spectral image, and why is it pixelated at 6.155 arcseconds?' },
-    { label: 'Explain infrared light in simple words!', query: 'Can you explain infrared light in simple words like I am 12 years old?' },
+    { label: 'What am I seeing in this NASA image?', query: `What am I seeing in this NASA SPHEREx spectral observation of ${activeTargetName}?` },
+    { label: 'Why does this star look different in infrared?', query: `Why does ${activeTargetName} look so different in infrared light compared to visible light?` },
+    { label: 'What changed between these observations?', query: `What changed between these observations in the Sky Time Machine?` },
+    { label: 'What is SPHEREx?', query: 'What is NASA SPHEREx and how does its 102-band all-sky spectrophotometry survey work?' },
+    { label: "Can you explain this like I'm 10?", query: `Can you explain ${activeTargetName} and infrared light like I'm 10 years old?` },
+    { label: 'Can you quiz me about this object?', query: `Can you quiz me about ${activeTargetName} to test my astronomy knowledge?` },
   ]
 
   // Auto-scroll chat to bottom
@@ -149,6 +152,10 @@ export default function AstroAiPage({
 
       setMessages((prev) => [...prev, aiMsg])
 
+      if (response.notice) {
+        setErrorNotice(response.notice)
+      }
+
       if (speakAloud) {
         speakText(response.text, aiMsg.id)
       }
@@ -216,26 +223,44 @@ export default function AstroAiPage({
 
     const recognition = new SpeechRecognition()
     recognition.lang = 'en-US'
+    recognition.continuous = false
     recognition.interimResults = false
 
     if (!isListening) {
       setIsListening(true)
-      recognition.start()
+      setErrorNotice(null)
+      try {
+        recognition.start()
+      } catch (err) {
+        setIsListening(false)
+        setErrorNotice('Could not start speech recognition: ' + (err.message || 'Browser permission required.'))
+        return
+      }
+
       recognition.onresult = (event) => {
         const transcript = event.results[0][0].transcript
         setIsListening(false)
         setInputText(transcript)
         handleSend(transcript)
       }
-      recognition.onerror = () => {
+      recognition.onerror = (event) => {
         setIsListening(false)
+        if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+          setErrorNotice('Microphone access was denied. Please allow microphone permissions in your browser or type in the chat box!')
+        } else if (event.error !== 'no-speech') {
+          setErrorNotice(`Microphone error: ${event.error}. Please type your question in the text bar.`)
+        }
       }
       recognition.onend = () => {
         setIsListening(false)
       }
     } else {
       setIsListening(false)
-      recognition.stop()
+      try {
+        recognition.stop()
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -280,6 +305,19 @@ export default function AstroAiPage({
             <span className={`h-3 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-75' : 'opacity-40'}`} />
             <span className={`h-1.5 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-150' : 'opacity-40'}`} />
           </div>
+          {speakingMsgId && (
+            <button
+              type="button"
+              onClick={() => {
+                if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+                setSpeakingMsgId(null)
+              }}
+              className="ml-1.5 cursor-pointer rounded bg-red-600/90 px-2 py-0.5 text-[0.65rem] font-bold text-white hover:bg-red-500 transition"
+              title="Stop Speech Playback"
+            >
+              ⏹ Stop Speaking
+            </button>
+          )}
         </div>
       </div>
 
