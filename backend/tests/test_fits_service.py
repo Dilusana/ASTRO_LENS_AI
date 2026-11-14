@@ -16,6 +16,7 @@ from app.fits_service import (
     world_to_tan_pixel,
     compute_wcs_orientation,
     process_fits_image,
+    find_hdu1_end_offset,
 )
 
 
@@ -174,3 +175,35 @@ def test_process_fits_image_with_nans_does_not_crash():
 def test_process_fits_image_invalid_bytes_raises():
     with pytest.raises(FitsServiceError):
         process_fits_image(b"not a valid fits file", target_ra=10.0, target_dec=40.0)
+
+
+# --- HDU 1 End Offset Detection & Partial Cutout Optimization -----------------
+
+def test_find_hdu1_end_offset_valid():
+    fits_bytes = _create_synthetic_fits_cutout(shape=(24, 24))
+    offset = find_hdu1_end_offset(fits_bytes)
+    assert offset is not None
+    assert offset <= len(fits_bytes)
+    assert offset % 2880 == 0
+
+    # Ensure sliced bytes are a complete valid FITS file with HDU 1
+    with fits.open(io.BytesIO(fits_bytes[:offset])) as hdul:
+        assert len(hdul) >= 2
+        assert hdul[1].name == "IMAGE"
+        assert hdul[1].data.shape == (24, 24)
+
+
+def test_find_hdu1_end_offset_truncated():
+    fits_bytes = _create_synthetic_fits_cutout(shape=(24, 24))
+    # Truncate halfway through header
+    assert find_hdu1_end_offset(fits_bytes[:3000]) is None
+    # Truncate to zero bytes
+    assert find_hdu1_end_offset(b"") is None
+
+
+def test_fits_service_error_structure():
+    err = FitsServiceError("Service unavailable", status_code=503, error_code="upstream_503", details={"try": 1})
+    assert err.status_code == 503
+    assert err.error_code == "upstream_503"
+    assert err.details == {"try": 1}
+    assert str(err) == "Service unavailable"

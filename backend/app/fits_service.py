@@ -11,8 +11,11 @@ import asyncio
 import hashlib
 import io
 import json
+import logging
 import math
 import os
+import re
+import warnings
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -21,6 +24,8 @@ import httpx
 import numpy as np
 from astropy.io import fits
 from PIL import Image
+
+logger = logging.getLogger("astrolens.fits")
 
 USER_AGENT = "AstroLensX/0.1 (SPHEREx archive client)"
 TRUSTED_HOST = "irsa.ipac.caltech.edu"
@@ -33,9 +38,17 @@ PREVIEW_CACHE_DIR = CACHE_DIR / "previews"
 
 
 class FitsServiceError(Exception):
-    def __init__(self, message: str, status_code: int = 502) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 502,
+        error_code: str = "fits_error",
+        details: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.error_code = error_code
+        self.details = details or {}
 
 
 def _ensure_cache_dirs() -> None:
@@ -46,19 +59,21 @@ def _ensure_cache_dirs() -> None:
 def validate_trusted_irsa_url(url: str | None) -> str:
     """Validate that the given URL strictly points to NASA IRSA SPHEREx data."""
     if not url or not isinstance(url, str):
-        raise FitsServiceError("No FITS access URL provided.", status_code=400)
+        raise FitsServiceError("No FITS access URL provided.", status_code=400, error_code="invalid_url")
     parsed = urlparse(url.strip())
     if parsed.scheme != "https":
-        raise FitsServiceError("FITS URL must use HTTPS.", status_code=400)
+        raise FitsServiceError("FITS URL must use HTTPS.", status_code=400, error_code="insecure_protocol")
     if parsed.hostname != TRUSTED_HOST:
         raise FitsServiceError(
             f"FITS URL host {parsed.hostname!r} is not trusted NASA IRSA host.",
             status_code=400,
+            error_code="untrusted_host",
         )
     if not parsed.path.startswith(TRUSTED_PATH_PREFIX) or not parsed.path.endswith(".fits"):
         raise FitsServiceError(
             "FITS URL path must be a valid IRSA SPHEREx .fits product.",
             status_code=400,
+            error_code="invalid_path",
         )
     return f"https://{TRUSTED_HOST}{parsed.path}"
 
@@ -66,6 +81,73 @@ def validate_trusted_irsa_url(url: str | None) -> str:
 def get_cache_key(fits_url: str, ra: float, dec: float, size_deg: float) -> str:
     seed = f"{fits_url}|{ra:.8f}|{dec:.8f}|{size_deg:.4f}"
     return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+def find_hdu1_end_offset(buf: bytes) -> int | None:
+    """Inspect FITS bytes to find the exact byte offset where HDU 1 ('IMAGE') finishes.
+
+    In NASA SPHEREx cutouts, HDU 0 is a PrimaryHDU with NAXIS=0 (header only),
+    and HDU 1 is the 2D scientific IMAGE plane. Subsequent HDUs (FLAGS, VARIANCE,
+    ZODI, and especially large EPSF tables which can exceed 3.8 MB) are not needed
+    for rendering the scientific image.
+
+    Returns the byte offset ending HDU 1, or None if HDU 1 is not yet complete.
+    """
+    if len(buf) < 2880 * 2:
+        return None
+
+    # 1. Find END card of Primary HDU
+    pos = 0
+    primary_end = None
+    while pos + 2880 <= len(buf):
+        block = buf[pos : pos + 2880]
+        for i in range(0, 2880, 80):
+            if block[i : i + 80].startswith(b"END "):
+                primary_end = pos + 2880
+                break
+        if primary_end is not None:
+            break
+        pos += 2880
+
+    if primary_end is None:
+        return None
+
+    # Primary HDU in SPHEREx QR3 has NAXIS=0, so no data block follows it.
+    # 2. Find END card of HDU 1
+    pos = primary_end
+    hdu1_header_end = None
+    hdu1_header_bytes = b""
+    while pos + 2880 <= len(buf):
+        block = buf[pos : pos + 2880]
+        hdu1_header_bytes += block
+        for i in range(0, 2880, 80):
+            if block[i : i + 80].startswith(b"END "):
+                hdu1_header_end = pos + 2880
+                break
+        if hdu1_header_end is not None:
+            break
+        pos += 2880
+
+    if hdu1_header_end is None:
+        return None
+
+    # Parse NAXIS1, NAXIS2, BITPIX from hdu1_header_bytes
+    header_str = hdu1_header_bytes.decode("ascii", errors="ignore")
+    bitpix_m = re.search(r"BITPIX\s*=\s*(-?\d+)", header_str)
+    naxis1_m = re.search(r"NAXIS1\s*=\s*(\d+)", header_str)
+    naxis2_m = re.search(r"NAXIS2\s*=\s*(\d+)", header_str)
+    if not (bitpix_m and naxis1_m and naxis2_m):
+        return None
+
+    bitpix = int(bitpix_m.group(1))
+    naxis1 = int(naxis1_m.group(1))
+    naxis2 = int(naxis2_m.group(1))
+    data_size = math.ceil(naxis1 * naxis2 * (abs(bitpix) // 8) / 2880) * 2880
+    total_end = hdu1_header_end + data_size
+
+    if len(buf) >= total_end:
+        return total_end
+    return None
 
 
 def _extract_cd_matrix(header: fits.Header) -> tuple[float, float, float, float]:
@@ -185,92 +267,103 @@ def process_fits_image(
     normalize with Asinh + Percentile stretch, and encode to PNG.
     """
     try:
-        with fits.open(io.BytesIO(fits_bytes)) as hdul:
-            # Locate the primary scientific image HDU
-            image_hdu = None
-            if "IMAGE" in hdul and hdul["IMAGE"].data is not None and hdul["IMAGE"].data.ndim == 2:
-                image_hdu = hdul["IMAGE"]
-            else:
-                for h in hdul:
-                    if h.data is not None and getattr(h.data, "ndim", 0) == 2:
-                        image_hdu = h
-                        break
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with fits.open(io.BytesIO(fits_bytes)) as hdul:
+                # Locate the primary scientific image HDU
+                image_hdu = None
+                if "IMAGE" in hdul and hdul["IMAGE"].data is not None and hdul["IMAGE"].data.ndim == 2:
+                    image_hdu = hdul["IMAGE"]
+                else:
+                    for h in hdul:
+                        if h.data is not None and getattr(h.data, "ndim", 0) == 2:
+                            image_hdu = h
+                            break
 
-            if image_hdu is None:
-                raise FitsServiceError("No 2D scientific image plane found in FITS cutout.")
+                if image_hdu is None:
+                    raise FitsServiceError(
+                        "No 2D scientific image plane found in FITS cutout.",
+                        status_code=502,
+                        error_code="missing_image_plane",
+                    )
 
-            header = image_hdu.header
-            raw_data = np.asarray(image_hdu.data, dtype=np.float32)
-            bunit = str(header.get("BUNIT", "MJy / sr")).strip()
-            obs_id = str(header.get("OBS_ID", header.get("OBSID", "SPHEREx Level-2"))).strip()
-            naxis1 = int(header.get("NAXIS1", raw_data.shape[1]))
-            naxis2 = int(header.get("NAXIS2", raw_data.shape[0]))
+                header = image_hdu.header
+                raw_data = np.asarray(image_hdu.data, dtype=np.float32)
+                bunit = str(header.get("BUNIT", "MJy / sr")).strip()
+                obs_id = str(header.get("OBS_ID", header.get("OBSID", "SPHEREx Level-2"))).strip()
+                naxis1 = int(header.get("NAXIS1", raw_data.shape[1]))
+                naxis2 = int(header.get("NAXIS2", raw_data.shape[0]))
 
-            # Validate coordinate footprint using FITS WCS
-            px, py, inside = world_to_tan_pixel(target_ra, target_dec, header)
-            wcs_meta = compute_wcs_orientation(header)
+                # Validate coordinate footprint using FITS WCS
+                px, py, inside = world_to_tan_pixel(target_ra, target_dec, header)
+                wcs_meta = compute_wcs_orientation(header)
 
-            # Scientific image normalization
-            valid_mask = np.isfinite(raw_data)
-            if not np.any(valid_mask):
-                norm_img = np.zeros(raw_data.shape, dtype=np.uint8)
-                vmin, vmax = 0.0, 0.0
-            else:
-                valid_pixels = raw_data[valid_mask]
-                vmin = float(np.percentile(valid_pixels, 0.5))
-                vmax = float(np.percentile(valid_pixels, 99.5))
-                if vmax <= vmin:
-                    vmax = vmin + 1e-6
+                # Scientific image normalization
+                valid_mask = np.isfinite(raw_data)
+                if not np.any(valid_mask):
+                    norm_img = np.zeros(raw_data.shape, dtype=np.uint8)
+                    vmin, vmax = 0.0, 0.0
+                else:
+                    valid_pixels = raw_data[valid_mask]
+                    vmin = float(np.percentile(valid_pixels, 0.5))
+                    vmax = float(np.percentile(valid_pixels, 99.5))
+                    if vmax <= vmin:
+                        vmax = vmin + 1e-6
 
-                # Scale to [0, 1]
-                clipped = np.clip((raw_data - vmin) / (vmax - vmin), 0.0, 1.0)
+                    # Scale to [0, 1]
+                    clipped = np.clip((raw_data - vmin) / (vmax - vmin), 0.0, 1.0)
 
-                # Standard astronomical asinh stretch
-                non_linear = 0.1
-                factor = math.asinh(1.0 / non_linear)
-                asinh_scaled = np.arcsinh(clipped / non_linear) / factor
-                asinh_scaled = np.nan_to_num(asinh_scaled, nan=0.0)
+                    # Standard astronomical asinh stretch
+                    non_linear = 0.1
+                    factor = math.asinh(1.0 / non_linear)
+                    asinh_scaled = np.arcsinh(clipped / non_linear) / factor
+                    asinh_scaled = np.nan_to_num(asinh_scaled, nan=0.0)
 
-                norm_img = np.clip(asinh_scaled * 255.0, 0, 255).astype(np.uint8)
+                    norm_img = np.clip(asinh_scaled * 255.0, 0, 255).astype(np.uint8)
 
-            # FITS native coordinates have row 0 at bottom.
-            # In screen coordinates, row 0 is at top, so flip vertically for standard display orientation.
-            display_img = np.flipud(norm_img)
+                # FITS native coordinates have row 0 at bottom.
+                # In screen coordinates, row 0 is at top, so flip vertically for standard display orientation.
+                display_img = np.flipud(norm_img)
 
-            # Compute target pixel coordinates in the display coordinate space (0-based from top-left)
-            display_target_x = px
-            display_target_y = (naxis2 - 1.0 - py) if py is not None else None
+                # Compute target pixel coordinates in the display coordinate space (0-based from top-left)
+                display_target_x = px
+                display_target_y = (naxis2 - 1.0 - py) if py is not None else None
 
-            # Convert to PNG using Pillow
-            pil_image = Image.fromarray(display_img, mode="L")
-            png_buffer = io.BytesIO()
-            pil_image.save(png_buffer, format="PNG", optimize=True)
-            png_bytes = png_buffer.getvalue()
+                # Convert to PNG using Pillow
+                pil_image = Image.fromarray(display_img, mode="L")
+                png_buffer = io.BytesIO()
+                pil_image.save(png_buffer, format="PNG", optimize=True)
+                png_bytes = png_buffer.getvalue()
 
-            metadata = {
-                "dimensions": [naxis1, naxis2],
-                "bunit": bunit,
-                "obs_id": obs_id,
-                "flux_min": round(vmin, 4),
-                "flux_max": round(vmax, 4),
-                "stretch": "Asinh (99.5% percentile interval)",
-                "target_coordinates": {"ra": target_ra, "dec": target_dec},
-                "target_pixel": {
-                    "fits_x": px,
-                    "fits_y": py,
-                    "display_x": round(display_target_x, 1) if display_target_x is not None else None,
-                    "display_y": round(display_target_y, 1) if display_target_y is not None else None,
-                },
-                "inside_footprint": inside,
-                "wcs": wcs_meta,
-            }
+                metadata = {
+                    "dimensions": [naxis1, naxis2],
+                    "bunit": bunit,
+                    "obs_id": obs_id,
+                    "flux_min": round(vmin, 4),
+                    "flux_max": round(vmax, 4),
+                    "stretch": "Asinh (99.5% percentile interval)",
+                    "target_coordinates": {"ra": target_ra, "dec": target_dec},
+                    "target_pixel": {
+                        "fits_x": px,
+                        "fits_y": py,
+                        "display_x": round(display_target_x, 1) if display_target_x is not None else None,
+                        "display_y": round(display_target_y, 1) if display_target_y is not None else None,
+                    },
+                    "inside_footprint": inside,
+                    "wcs": wcs_meta,
+                }
 
-            return png_bytes, metadata
+                return png_bytes, metadata
 
     except Exception as exc:
         if isinstance(exc, FitsServiceError):
             raise
-        raise FitsServiceError(f"Failed to process FITS cutout: {exc}") from exc
+        logger.error("Failed to parse FITS cutout bytes: %s", exc, exc_info=True)
+        raise FitsServiceError(
+            f"Failed to process FITS cutout: {exc}",
+            status_code=502,
+            error_code="corrupt_fits_data",
+        ) from exc
 
 
 _IN_FLIGHT_LOCKS: dict[str, asyncio.Lock] = {}
@@ -280,60 +373,129 @@ async def fetch_cutout_bytes(
     client: httpx.AsyncClient,
     cutout_url: str,
 ) -> bytes:
-    """Download cutout bytes with size limits, retry on 503/429, and timeout handling."""
+    """Download cutout bytes with size limits, early HDU 1 completion, and bounded retries."""
     max_retries = 3
     for attempt in range(max_retries):
+        logger.info(
+            "Requesting SPHEREx FITS cutout (attempt %d/%d): %s",
+            attempt + 1,
+            max_retries,
+            cutout_url,
+        )
+        buffer = io.BytesIO()
         try:
             async with client.stream("GET", cutout_url) as response:
-                if response.status_code in (502, 503, 429) and attempt < max_retries - 1:
-                    await asyncio.sleep(2.0 * (attempt + 1))
-                    continue
+                if response.status_code in (502, 503, 429):
+                    delay = 1.5 * (attempt + 1)
+                    logger.warning(
+                        "IRSA returned transient HTTP %d on attempt %d; retrying in %.1fs",
+                        response.status_code,
+                        attempt + 1,
+                        delay,
+                    )
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(delay)
+                        continue
+                    raise FitsServiceError(
+                        f"NASA IRSA cutout service is temporarily unavailable (HTTP {response.status_code}).",
+                        status_code=503,
+                        error_code="upstream_unavailable",
+                        details={"upstream_status": response.status_code},
+                    )
 
                 if response.status_code != 200:
+                    logger.error(
+                        "IRSA returned non-retryable HTTP %d on attempt %d: %s",
+                        response.status_code,
+                        attempt + 1,
+                        cutout_url,
+                    )
                     raise FitsServiceError(
-                        f"IRSA cutout service returned HTTP {response.status_code}.",
+                        f"NASA IRSA cutout service returned HTTP {response.status_code}.",
                         status_code=502,
+                        error_code="upstream_error",
+                        details={"upstream_status": response.status_code},
                     )
 
                 # Verify Content-Length header if present
                 cl_header = response.headers.get("content-length")
                 if cl_header and int(cl_header) > MAX_DOWNLOAD_BYTES:
                     raise FitsServiceError(
-                        f"Cutout size ({cl_header} bytes) exceeds limit of {MAX_DOWNLOAD_BYTES} bytes.",
+                        f"Cutout size ({cl_header} bytes) exceeds download limit of {MAX_DOWNLOAD_BYTES} bytes.",
                         status_code=502,
+                        error_code="size_limit_exceeded",
                     )
 
-                buffer = io.BytesIO()
                 total_bytes = 0
-                async for chunk in response.aiter_bytes(chunk_size=65536):
+                async for chunk in response.aiter_bytes(chunk_size=32768):
                     total_bytes += len(chunk)
                     if total_bytes > MAX_DOWNLOAD_BYTES:
                         raise FitsServiceError(
-                            f"Cutout exceeded download limit of {MAX_DOWNLOAD_BYTES} bytes.",
+                            f"Cutout stream exceeded limit of {MAX_DOWNLOAD_BYTES} bytes.",
                             status_code=502,
+                            error_code="size_limit_exceeded",
                         )
                     buffer.write(chunk)
 
-                return buffer.getvalue()
+                    # Optimize: As soon as HDU 1 ('IMAGE') has been fully received,
+                    # we can cleanly stop reading. This avoids stalling on large
+                    # auxiliary tables like HDU 5 (EPSF) which can exceed 3.8 MB.
+                    if total_bytes >= 2880 * 4:
+                        hdu1_end = find_hdu1_end_offset(buffer.getvalue())
+                        if hdu1_end is not None:
+                            logger.info(
+                                "Complete 2D IMAGE HDU received at %d bytes (total streamed: %d). Early exit for preview.",
+                                hdu1_end,
+                                total_bytes,
+                            )
+                            return buffer.getvalue()[:hdu1_end]
 
-        except httpx.TimeoutException as exc:
+                final_data = buffer.getvalue()
+                logger.info("Cutout stream completed normally: %d bytes", len(final_data))
+                return final_data
+
+        except (httpx.HTTPError, httpx.TimeoutException) as exc:
+            # If the remote connection dropped (e.g. BrokenResourceError during subsequent HDUs),
+            # check if we already received a valid complete IMAGE HDU.
+            current_bytes = buffer.getvalue()
+            hdu1_end = find_hdu1_end_offset(current_bytes)
+            if hdu1_end is not None:
+                logger.warning(
+                    "Cutout stream interrupted by %s after %d bytes, but complete IMAGE HDU is available. Recovering.",
+                    type(exc).__name__,
+                    len(current_bytes),
+                )
+                return current_bytes[:hdu1_end]
+
+            logger.warning(
+                "Cutout download encountered %s on attempt %d/%d: %s",
+                type(exc).__name__,
+                attempt + 1,
+                max_retries,
+                exc,
+            )
             if attempt < max_retries - 1:
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(1.5 * (attempt + 1))
                 continue
+
+            if isinstance(exc, httpx.TimeoutException):
+                raise FitsServiceError(
+                    "Timed out downloading SPHEREx FITS cutout from NASA IRSA.",
+                    status_code=504,
+                    error_code="upstream_timeout",
+                ) from exc
+
             raise FitsServiceError(
-                "Timed out downloading SPHEREx FITS cutout from NASA IRSA.",
-                status_code=504,
-            ) from exc
-        except httpx.HTTPError as exc:
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2.0)
-                continue
-            raise FitsServiceError(
-                f"Network error downloading SPHEREx FITS cutout: {exc}",
+                f"Network error communicating with NASA IRSA cutout service: {exc}",
                 status_code=502,
+                error_code="network_error",
             ) from exc
 
-    raise FitsServiceError("IRSA cutout service was temporarily unavailable.", status_code=503)
+    raise FitsServiceError(
+        "NASA IRSA cutout service was temporarily unavailable after multiple attempts.",
+        status_code=503,
+        error_code="max_retries_exceeded",
+    )
 
 
 async def get_or_render_preview(
@@ -356,9 +518,10 @@ async def get_or_render_preview(
             png_bytes = png_cache_file.read_bytes()
             metadata = json.loads(meta_cache_file.read_text(encoding="utf-8"))
             metadata["cached"] = True
+            logger.debug("Cache hit for key %s (fits_url=%s)", cache_key, trusted_url)
             return png_bytes, metadata
         except Exception:
-            pass  # Fall through to re-download if cache was corrupted
+            logger.warning("Cache corruption on key %s; re-downloading", cache_key)
 
     # Deduplicate concurrent requests for the exact same cutout
     lock = _IN_FLIGHT_LOCKS.setdefault(cache_key, asyncio.Lock())
@@ -376,7 +539,7 @@ async def get_or_render_preview(
         # Construct the IRSA cutout URL
         cutout_url = f"{trusted_url}?center={ra:.8f},{dec:.8f}&size={size_deg:.4f}"
 
-        timeout = httpx.Timeout(90.0, connect=20.0)
+        timeout = httpx.Timeout(60.0, connect=15.0)
         async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT}) as client:
             fits_bytes = await fetch_cutout_bytes(client, cutout_url)
 
@@ -390,7 +553,8 @@ async def get_or_render_preview(
         try:
             png_cache_file.write_bytes(png_bytes)
             meta_cache_file.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+            logger.info("Successfully rendered and cached FITS preview key %s", cache_key)
+        except Exception as e:
+            logger.warning("Failed to save preview cache: %s", e)
 
         return png_bytes, metadata
