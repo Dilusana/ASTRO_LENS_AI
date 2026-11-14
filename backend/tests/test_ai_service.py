@@ -160,22 +160,17 @@ def test_claude_api_mock_integration(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-12345")
     monkeypatch.setenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 
-    mock_content = MagicMock()
-    mock_content.text = (
-        "Betelgeuse is an enormous red supergiant star in Orion.\n"
-        "FOLLOW_UP: How big is Betelgeuse compared to the Sun?\n"
-        "FOLLOW_UP: When will it explode?"
-    )
+    mock_result = {
+        "success": True,
+        "text": "Betelgeuse is an enormous red supergiant star in Orion.",
+        "model": "claude-3-5-sonnet-20241022",
+        "follow_ups": [
+            "How big is Betelgeuse compared to the Sun?",
+            "When will it explode?",
+        ],
+    }
 
-    mock_response = MagicMock()
-    mock_response.content = [mock_content]
-    mock_response.model = "claude-3-5-sonnet-20241022"
-
-    mock_client = MagicMock()
-    mock_client.messages = MagicMock()
-    mock_client.messages.create = AsyncMock(return_value=mock_response)
-
-    with patch("anthropic.AsyncAnthropic", return_value=mock_client):
+    with patch("app.ai_service._call_claude_api", return_value=mock_result):
         req = ChatRequest(
             message="Tell me about Betelgeuse",
             target_id="betelgeuse",
@@ -199,12 +194,8 @@ def test_claude_api_mock_integration(monkeypatch):
 def test_claude_fallback_on_api_error(monkeypatch):
     """Verify that if Anthropic API throws an exception, it seamlessly falls back to local reasoning."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-invalid")
-    
-    mock_client = MagicMock()
-    mock_client.messages = MagicMock()
-    mock_client.messages.create = AsyncMock(side_effect=Exception("Anthropic API connection timeout"))
 
-    with patch("anthropic.AsyncAnthropic", return_value=mock_client):
+    with patch("app.ai_service._call_claude_api", return_value={"error_type": "timeout", "error_message": "Anthropic API request timed out (15s limit)."}):
         req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
         resp = asyncio.run(generate_ai_chat_response(req))
         assert isinstance(resp, ChatResponse)

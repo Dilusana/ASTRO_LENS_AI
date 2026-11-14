@@ -493,7 +493,6 @@ async def _call_claude_api(
         resp = await client.messages.create(
             model=model_name,
             max_tokens=700,
-            temperature=0.35,
             system=system_prompt,
             messages=formatted_messages,
         )

@@ -1,47 +1,6 @@
-import { useState } from 'react'
+import NightSkyViewer from '../components/NightSkyViewer'
 
 export default function HomePage({ onNavigate, onSelectTarget, catalog = [] }) {
-  const [activePin, setActivePin] = useState(null)
-
-  const pins = [
-    {
-      id: 'carina-core',
-      name: 'Carina Nebula (NGC 3372)',
-      type: 'Diffuse Star-Forming Nebula',
-      distance: '7,500 light-years',
-      x: '38%',
-      y: '52%',
-      color: 'cyan',
-    },
-    {
-      id: 'homunculus',
-      name: 'Homunculus Nebula (Eta Carinae)',
-      type: 'Luminous Blue Variable Outburst',
-      distance: '7,500 light-years',
-      x: '62%',
-      y: '38%',
-      color: 'amber',
-    },
-    {
-      id: 'trumpler16',
-      name: 'Trumpler 16 Cluster',
-      type: 'Massive Open Star Cluster',
-      distance: '9,200 light-years',
-      x: '25%',
-      y: '32%',
-      color: 'purple',
-    },
-    {
-      id: 'keyhole',
-      name: 'Keyhole Nebula',
-      type: 'Dense Molecular Dark Cloud',
-      distance: '7,500 light-years',
-      x: '75%',
-      y: '65%',
-      color: 'pink',
-    },
-  ]
-
   function handleSurpriseTarget() {
     if (catalog.length === 0) {
       onNavigate?.('explore')
@@ -100,116 +59,13 @@ export default function HomePage({ onNavigate, onSelectTarget, catalog = [] }) {
         </div>
       </section>
 
-      {/* 2. Interactive Deep-Field Canvas Card */}
-      <section className="max-w-6xl mx-auto px-4">
-        <div className="relative rounded-2xl border border-line/80 bg-panel/60 overflow-hidden shadow-[0_20px_50px_rgba(0,0,0,0.6)] backdrop-blur-sm">
-          {/* Top Canvas Metadata Bar */}
-          <div className="flex flex-wrap items-center justify-between border-b border-white/10 bg-black/40 px-4 py-2.5 text-[0.68rem] font-mono text-slate-300">
-            <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
-              <span className="text-cyan-200">TARGET: CARINA & SP CLUSTER NGC 3372</span>
-            </div>
-            <div className="flex items-center gap-3 text-muted">
-              <span>Filter: 1.15 – 5.0 µm</span>
-              <span className="hidden sm:inline">•</span>
-              <span className="text-slate-200">Optical Resolution: High</span>
-            </div>
-          </div>
-
-          {/* Deep-Field Canvas Area with Glowing Pins */}
-          <div
-            className="relative h-72 sm:h-96 w-full overflow-hidden bg-cover bg-center select-none"
-            style={{
-              backgroundImage: `radial-gradient(ellipse at 40% 50%, rgba(139, 92, 246, 0.35) 0%, rgba(6, 182, 212, 0.25) 45%, rgba(5, 8, 20, 0.95) 100%), url('https://images-assets.nasa.gov/image/PIA14445/PIA14445~thumb.jpg')`,
-              backgroundBlendMode: 'screen',
-            }}
-          >
-            {/* Ambient Starfield & Nebula Glow Overlay */}
-            <div className="absolute inset-0 bg-radial from-transparent via-black/40 to-black/80 pointer-events-none" />
-
-            {/* Glowing Interactive Pins */}
-            {pins.map((pin) => {
-              const isHovered = activePin === pin.id
-              return (
-                <div
-                  key={pin.id}
-                  style={{ left: pin.x, top: pin.y }}
-                  className="absolute -translate-x-1/2 -translate-y-1/2 z-20 cursor-pointer group"
-                  onMouseEnter={() => setActivePin(pin.id)}
-                  onMouseLeave={() => setActivePin(null)}
-                  onClick={() => {
-                    onSelectTarget?.('m42')
-                    onNavigate?.('explore')
-                  }}
-                >
-                  {/* Pin Halo */}
-                  <span
-                    className={`absolute -inset-2 rounded-full animate-ping opacity-60 ${
-                      pin.color === 'cyan'
-                        ? 'bg-cyan-400'
-                        : pin.color === 'amber'
-                        ? 'bg-amber-400'
-                        : pin.color === 'pink'
-                        ? 'bg-pink-400'
-                        : 'bg-purple-400'
-                    }`}
-                  />
-                  {/* Pin Center Core */}
-                  <div
-                    className={`relative flex h-5 w-5 items-center justify-center rounded-full border-2 border-white shadow-lg transition duration-200 group-hover:scale-125 ${
-                      pin.color === 'cyan'
-                        ? 'bg-cyan-500 shadow-cyan-500/50'
-                        : pin.color === 'amber'
-                        ? 'bg-amber-500 shadow-amber-500/50'
-                        : pin.color === 'pink'
-                        ? 'bg-pink-500 shadow-pink-500/50'
-                        : 'bg-purple-500 shadow-purple-500/50'
-                    }`}
-                  >
-                    <span className="h-1.5 w-1.5 rounded-full bg-white" />
-                  </div>
-
-                  {/* Interactive Tooltip Card */}
-                  {isHovered && (
-                    <div className="absolute left-1/2 bottom-full mb-3 -translate-x-1/2 w-48 rounded-xl border border-line bg-panel/95 p-2.5 text-xs text-ink shadow-[0_10px_25px_rgba(0,0,0,0.8)] backdrop-blur-md z-30 pointer-events-none animate-in fade-in zoom-in-95 duration-150">
-                      <p className="font-semibold text-white">{pin.name}</p>
-                      <p className="text-[0.68rem] text-cyan-300 font-mono mt-0.5">{pin.type}</p>
-                      <p className="text-[0.65rem] text-muted mt-1">Distance: {pin.distance}</p>
-                      <p className="text-[0.62rem] text-pink-300 mt-1 font-medium">Click to inspect in Atlas →</p>
-                    </div>
-                  )}
-                </div>
-              )
-            })}
-          </div>
-
-          {/* Bottom Bar Overlay on Canvas */}
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-white/10 bg-[#070c18]/90 px-4 py-3">
-            <div className="flex items-center gap-3">
-              <div className="flex h-7 w-7 items-center justify-center rounded-lg border border-purple-500/30 bg-purple-950/40 text-purple-300">
-                <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
-                </svg>
-              </div>
-              <div>
-                <p className="text-xs font-semibold text-white">Interactive Deep-Field Canvas</p>
-                <p className="text-[0.68rem] text-muted">Hover pins to reveal cosmic collections or pan the night sky</p>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-3">
-              <span className="text-[0.7rem] font-mono text-cyan-300 hidden sm:inline">+55+ Objects Mapped</span>
-              <button
-                type="button"
-                onClick={() => onNavigate?.('explore')}
-                className="cursor-pointer rounded-full border border-purple-400/40 bg-gradient-to-r from-purple-600 to-pink-600 px-4 py-1.5 text-xs font-semibold text-white shadow-[0_0_15px_rgba(168,85,247,0.3)] transition hover:scale-105 active:scale-95"
-              >
-                Open Sky Atlas
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* 2. Large Immersive Night Sky Viewer Section */}
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+        <NightSkyViewer
+          onNavigate={onNavigate}
+          onSelectTarget={onSelectTarget}
+          catalog={catalog}
+        />
       </section>
 
       {/* 3. "WHAT YOU CAN DO" Three Cards Section */}
