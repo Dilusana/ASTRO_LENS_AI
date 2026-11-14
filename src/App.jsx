@@ -143,6 +143,7 @@ export default function App() {
         {currentPage === 'ai' && (
           <AstroAiPage
             selectedObject={selected}
+            archiveData={archive.objectId === selected?.id ? archive.data : null}
             onNavigate={handleNavigate}
             onSelectTarget={handleSelectTarget}
           />

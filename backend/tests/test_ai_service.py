@@ -1,18 +1,24 @@
 """
-Unit tests for Astro AI Chat Service and Guardrails.
-Tests fallback reasoning, astronomy knowledge grounding, planet X guardrail, and API schemas.
+Unit tests for Astro AI Chat Service, Claude AI integration, and Guardrails.
+Tests Anthropic SDK calling, system prompt construction, context injection,
+conversation history, fallback reasoning, astronomy knowledge grounding,
+planet X guardrail, and API schemas.
 Run with: python -m pytest tests/test_ai_service.py -v
 """
 import sys, os, asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
 from app.ai_service import (
+    ChatMessage,
     ChatRequest,
     ChatResponse,
     generate_fallback_response,
     generate_ai_chat_response,
     _match_target,
+    _build_claude_system_prompt,
+    _parse_follow_ups,
 )
 
 
@@ -110,9 +116,105 @@ def test_pixel_resolution_explanation():
     assert "calibrated" in resp.text.lower()
 
 
-def test_async_generate_ai_chat_response(monkeypatch):
+def test_parse_follow_ups():
+    raw_text = (
+        "Betelgeuse is a red supergiant.\n"
+        "FOLLOW_UP: Why did it dim in 2019?\n"
+        "FOLLOW_UP: When will it go supernova?"
+    )
+    clean_text, follow_ups = _parse_follow_ups(raw_text)
+    assert clean_text == "Betelgeuse is a red supergiant."
+    assert len(follow_ups) == 2
+    assert "Why did it dim in 2019?" in follow_ups[0]
+    assert "When will it go supernova?" in follow_ups[1]
+
+
+def test_build_claude_system_prompt_with_context():
+    target = {
+        "name": "Betelgeuse",
+        "title": "Alpha Orionis",
+        "type": "Red Supergiant",
+        "distance": "642.5 light-years",
+        "metric_label": "TEMPERATURE",
+        "metric_value": "3,600 K",
+        "band": "SPHEREx Band 3.5 µm",
+    }
+    context = {
+        "observation_count": 80,
+        "bands": "SPHEREx-D1 to D6",
+        "earliest_date": "2026-09-12 15:41 UTC",
+        "latest_date": "2026-09-15 03:59 UTC",
+        "repeat_coverage_found": True,
+        "span_days": 2.51,
+    }
+    prompt = _build_claude_system_prompt(target, context)
+    assert "Betelgeuse" in prompt
+    assert "642.5 light-years" in prompt
+    assert "2026-09-12 15:41 UTC" in prompt
+    assert "NEVER invent" in prompt
+    assert "Planet Nine" in prompt
+
+
+def test_claude_api_mock_integration(monkeypatch):
+    """Test full integration with Claude AI via Anthropic Python SDK mock."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-12345")
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+
+    mock_content = MagicMock()
+    mock_content.text = (
+        "Betelgeuse is an enormous red supergiant star in Orion.\n"
+        "FOLLOW_UP: How big is Betelgeuse compared to the Sun?\n"
+        "FOLLOW_UP: When will it explode?"
+    )
+
+    mock_response = MagicMock()
+    mock_response.content = [mock_content]
+    mock_response.model = "claude-3-5-sonnet-20241022"
+
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_response)
+
+    with patch("anthropic.AsyncAnthropic", return_value=mock_client):
+        req = ChatRequest(
+            message="Tell me about Betelgeuse",
+            target_id="betelgeuse",
+            context={"observation_count": 80},
+            history=[
+                ChatMessage(role="user", content="Hello Astro!"),
+                ChatMessage(role="assistant", content="Hello! What would you like to explore?"),
+            ],
+        )
+        resp = asyncio.run(generate_ai_chat_response(req))
+
+        assert isinstance(resp, ChatResponse)
+        assert "enormous red supergiant" in resp.text
+        assert "claude-3-5-sonnet-20241022" in resp.source
+        assert resp.target_card is not None
+        assert resp.target_card.title == "Alpha Orionis"
+        assert len(resp.follow_up_questions) == 2
+        assert "How big is Betelgeuse" in resp.follow_up_questions[0]
+
+
+def test_claude_fallback_on_api_error(monkeypatch):
+    """Verify that if Anthropic API throws an exception, it seamlessly falls back to local reasoning."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-invalid")
+    
+    mock_client = MagicMock()
+    mock_client.messages = MagicMock()
+    mock_client.messages.create = AsyncMock(side_effect=Exception("Anthropic API connection timeout"))
+
+    with patch("anthropic.AsyncAnthropic", return_value=mock_client):
+        req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
+        resp = asyncio.run(generate_ai_chat_response(req))
+        assert isinstance(resp, ChatResponse)
+        assert "Betelgeuse" in resp.text
+        assert resp.target_card is not None
+
+
+def test_async_generate_ai_chat_response_fallback(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     req = ChatRequest(message="How far away is Barnard's Star?", target_id="barnards-star")
     resp = asyncio.run(generate_ai_chat_response(req))
     assert isinstance(resp, ChatResponse)
@@ -122,6 +224,10 @@ def test_async_generate_ai_chat_response(monkeypatch):
 
 if __name__ == "__main__":
     class MockMonkeyPatch:
+        def __init__(self):
+            self.env = {}
+        def setenv(self, key, value):
+            os.environ[key] = value
         def delenv(self, key, raising=False):
             os.environ.pop(key, None)
 
@@ -134,7 +240,9 @@ if __name__ == "__main__":
     test_proper_motion_explanation()
     test_infrared_light_explanation()
     test_pixel_resolution_explanation()
-    test_async_generate_ai_chat_response(mp)
-    print("All 9 test_ai_service assertions PASSED!")
-
-
+    test_parse_follow_ups()
+    test_build_claude_system_prompt_with_context()
+    test_claude_api_mock_integration(mp)
+    test_claude_fallback_on_api_error(mp)
+    test_async_generate_ai_chat_response_fallback(mp)
+    print("All 13 test_ai_service assertions PASSED!")

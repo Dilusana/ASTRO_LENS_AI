@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Query
+import time
+from collections import defaultdict
+from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -8,6 +10,31 @@ from .fits_service import FitsServiceError, get_or_render_preview
 from .spherex import SpherexError, search_observations
 
 app = FastAPI(title="AstroLens X SPHEREx API", version="0.1.0")
+
+# ── In-Memory Sliding Window Rate Limiter ──────────────────────────────────────────
+
+class SimpleRateLimiter:
+    """Sliding-window in-memory rate limiter per client IP."""
+    def __init__(self, max_requests: int = 30, window_seconds: float = 60.0):
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self.requests: dict[str, list[float]] = defaultdict(list)
+
+    def is_allowed(self, client_id: str) -> bool:
+        now = time.time()
+        timestamps = self.requests[client_id]
+        # Prune timestamps older than window
+        self.requests[client_id] = [t for t in timestamps if now - t < self.window_seconds]
+        if len(self.requests[client_id]) >= self.max_requests:
+            return False
+        self.requests[client_id].append(now)
+        return True
+
+    def reset(self):
+        self.requests.clear()
+
+ai_rate_limiter = SimpleRateLimiter(max_requests=30, window_seconds=60.0)
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -98,9 +125,16 @@ async def spherex_compare(
 
 
 @app.post("/api/ai/chat", response_model=ChatResponse)
-async def ai_chat(req: ChatRequest) -> ChatResponse:
+async def ai_chat(req: ChatRequest, request: Request) -> ChatResponse:
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    if not ai_rate_limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded. Please wait a moment before sending more messages to Astro AI.",
+        )
     try:
         return await generate_ai_chat_response(req)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"AI service error: {exc}") from exc
+
 

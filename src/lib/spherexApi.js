@@ -46,7 +46,7 @@ export async function fetchSpherexCompare({ fitsUrl1, fitsUrl2, ra, dec, sizeDeg
   return body
 }
 
-export async function fetchAstroAiChat({ message, targetId, context }, signal) {
+export async function fetchAstroAiChat({ message, targetId, context, history }, signal) {
   const response = await fetch('/api/ai/chat', {
     method: 'POST',
     headers: {
@@ -56,6 +56,7 @@ export async function fetchAstroAiChat({ message, targetId, context }, signal) {
       message,
       target_id: targetId || null,
       context: context || null,
+      history: history || null,
     }),
     signal,
   })

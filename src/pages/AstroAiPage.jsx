@@ -3,6 +3,7 @@ import { fetchAstroAiChat } from '../lib/spherexApi'
 
 export default function AstroAiPage({
   selectedObject,
+  archiveData,
   onNavigate,
   onSelectTarget,
 }) {
@@ -45,6 +46,7 @@ export default function AstroAiPage({
   const [isListening, setIsListening] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [speakingMsgId, setSpeakingMsgId] = useState(null)
+  const [errorNotice, setErrorNotice] = useState(null)
   const chatBottomRef = useRef(null)
 
   const activeTargetName = selectedObject?.name || 'Betelgeuse'
@@ -75,6 +77,7 @@ export default function AstroAiPage({
     const q = queryText || inputText
     if (!q.trim() || isLoading) return
 
+    setErrorNotice(null)
     messageCounterRef.current += 1
     const userMsg = {
       id: `user-${messageCounterRef.current}`,
@@ -87,20 +90,41 @@ export default function AstroAiPage({
     setInputText('')
     setIsLoading(true)
 
+    // Build rich context from target catalog & live SPHEREx observation telemetry
+    const context = {
+      name: selectedObject?.name,
+      designation: selectedObject?.designation,
+      distance: selectedObject?.distance,
+      category: selectedObject?.category,
+      ra: selectedObject?.ra,
+      dec: selectedObject?.dec,
+      summary: selectedObject?.summary,
+      whatToLookFor: selectedObject?.whatToLookFor,
+      ...(archiveData ? {
+        observation_count: archiveData.count,
+        bands: archiveData.comparable?.bands?.map(b => b.bandpass).join(', '),
+        earliest_date: archiveData.comparable?.bands?.[0]?.earliest,
+        latest_date: archiveData.comparable?.bands?.[0]?.latest,
+        repeat_coverage_found: archiveData.comparable?.repeat_coverage_found,
+        span_days: archiveData.comparable?.bands?.[0]?.span_days,
+      } : {}),
+    }
+
+    // Prepare multi-turn conversational history
+    const history = messages
+      .filter((m) => m.text)
+      .map((m) => ({
+        role: m.sender === 'user' ? 'user' : 'assistant',
+        content: m.text,
+      }))
+      .slice(-8)
+
     try {
       const response = await fetchAstroAiChat({
         message: q,
         targetId: selectedObject?.id || null,
-        context: selectedObject
-          ? {
-              name: selectedObject.name,
-              designation: selectedObject.designation,
-              distance: selectedObject.distance,
-              category: selectedObject.category,
-              ra: selectedObject.ra,
-              dec: selectedObject.dec,
-            }
-          : null,
+        context,
+        history,
       })
 
       messageCounterRef.current += 1
@@ -128,7 +152,11 @@ export default function AstroAiPage({
       if (speakAloud) {
         speakText(response.text, aiMsg.id)
       }
-    } catch {
+    } catch (err) {
+      if (err.message && err.message.toLowerCase().includes('rate limit')) {
+        setErrorNotice('Rate limit reached: Please wait a moment before sending another message to Astro AI.')
+      }
+
       // Graceful offline/client fallback
       messageCounterRef.current += 1
       const fallback = generateEducationalResponse(q, selectedObject)
@@ -447,6 +475,18 @@ export default function AstroAiPage({
 
       {/* 5. Fixed/Bottom Input Bar */}
       <section className="space-y-3">
+        {errorNotice && (
+          <div className="flex items-center justify-between rounded-xl border border-amber-500/40 bg-amber-950/40 px-3.5 py-2 text-xs text-amber-200">
+            <span>⚠ {errorNotice}</span>
+            <button
+              type="button"
+              onClick={() => setErrorNotice(null)}
+              className="text-amber-400 hover:text-white text-xs cursor-pointer ml-2"
+            >
+              ✕
+            </button>
+          </div>
+        )}
         <form
           onSubmit={(e) => {
             e.preventDefault()

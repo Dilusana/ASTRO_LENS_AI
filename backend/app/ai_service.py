@@ -1,9 +1,10 @@
 """
 AstroLens X - AI Chat Service
-Provides friendly, beginner-to-undergrad astronomy explanations grounded in real
-NASA SPHEREx mission data, astrophysics, and verified catalog parameters.
-Supports Gemini API when GEMINI_API_KEY is configured in the environment,
-with an intelligent built-in astronomical reasoning engine fallback.
+Integrates Claude AI (Anthropic Python SDK) with the NASA SPHEREx astronomy platform.
+Reads ANTHROPIC_API_KEY and CLAUDE_MODEL from the backend environment,
+injecting verified celestial target coordinates, SPHEREx observation dates,
+spectral bands, and comparison telemetry into Claude's system prompt.
+Features strict scientific guardrails and a robust local astronomical reasoning fallback.
 """
 from __future__ import annotations
 
@@ -12,6 +13,17 @@ import re
 from typing import Any, Dict, List, Optional
 import httpx
 from pydantic import BaseModel, Field
+
+try:
+    import anthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., pattern="^(user|assistant|system)$", description="Role of the sender")
+    content: str = Field(..., min_length=1, description="Message content")
 
 
 class TargetCard(BaseModel):
@@ -28,9 +40,10 @@ class Suggestion(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=1000)
+    message: str = Field(..., min_length=1, max_length=2000)
     target_id: Optional[str] = None
     context: Optional[Dict[str, Any]] = None
+    history: Optional[List[ChatMessage]] = None
 
 
 class ChatResponse(BaseModel):
@@ -40,6 +53,7 @@ class ChatResponse(BaseModel):
     target_card: Optional[TargetCard] = None
     suggestions: List[Suggestion] = []
     follow_up_questions: List[str] = []
+    model: Optional[str] = None
 
 
 # ── Curated Astronomical Knowledge Base ──────────────────────────────────────────
@@ -225,46 +239,127 @@ def _match_target(text: str, target_id: Optional[str]) -> Optional[Dict[str, Any
     return None
 
 
-async def _call_gemini_api(api_key: str, message: str, context: Optional[Dict[str, Any]]) -> Optional[str]:
-    """Optional external call to Google Gemini API when configured."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
-    system_prompt = (
-        "You are Astro AI, a friendly, encouraging celestial guide and astrophysics educator for AstroLens X, "
-        "an application powered by NASA SPHEREx mission observations. "
-        "Explain science simply for students (Grade 5 to undergraduate astrophysics). "
-        "Distinguish confirmed astronomical facts from scientific uncertainty. "
-        "Never hallucinate or invent fake planets, moving objects, or false transient discoveries. "
-        "If asked about Planet Nine / Planet X, explain that it remains a mathematical hypothesis based on Kuiper Belt "
-        "orbital clustering, and SPHEREx will provide stringent infrared constraints. "
-        "Ground your answers in real NASA infrared astrophysics and keep your response under 250 words."
-    )
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {"text": f"System Guidelines: {system_prompt}\nContext: {context or {}}\n\nUser Question: {message}"}
-                ],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": 450,
-        },
-    }
+def _build_claude_system_prompt(target: Optional[Dict[str, Any]], context: Optional[Dict[str, Any]]) -> str:
+    """Builds the astrophysics grounding system prompt for Claude."""
+    target_section = ""
+    if target:
+        target_section = f"""
+CELESTIAL TARGET CONTEXT:
+- Object Name: {target.get('name')} ({target.get('title')})
+- Classification: {target.get('type')}
+- Estimated Distance: {target.get('distance')}
+- Physical Metric: {target.get('metric_label')} = {target.get('metric_value')}
+- Primary Infrared Bandpass: {target.get('band')}
+"""
+
+    context_section = ""
+    if context:
+        obs_count = context.get("observation_count") or context.get("count")
+        bands = context.get("bands") or context.get("bandpasses")
+        earliest = context.get("earliest_date") or context.get("earliest")
+        latest = context.get("latest_date") or context.get("latest")
+        repeat = context.get("repeat_coverage_found")
+        delta_days = context.get("delta_days") or context.get("span_days")
+
+        context_section = f"""
+AUTHENTIC NASA SPHEREx MISSION TELEMETRY:
+- Total Observations Available: {obs_count or 'Survey Catalog Active'}
+- Spectral Bands Coverage: {bands or 'SPHEREx 102 Spectral Channels (0.75 - 5.0 µm)'}
+- Baseline Observation Epoch: {earliest or 'Level-2 Calibrated Survey'}
+- Repeat Observation Epoch: {latest or 'Calibrated Multi-Pass'}
+- Repeat Coverage Status: {'Confirmed Multi-Epoch Coverage' if repeat else 'Single Pass / Standard Survey'}
+- Temporal Separation: {f'{delta_days} days' if delta_days else 'Astronomical Time Baseline'}
+"""
+
+    return f"""You are Astro AI, an inspiring, enthusiastic astronomy tutor and celestial guide for AstroLens X, an educational web platform built for the NASA Space Apps Challenge and powered by NASA's SPHEREx mission.
+
+{target_section}
+{context_section}
+
+CORE EDUCATIONAL GUIDELINES:
+1. EXPLAIN FOR LEARNERS: Communicate naturally and warmly in plain English suitable for students (Grade 5 to university undergrad) and the general public.
+2. VIVID REAL-WORLD ANALOGIES: Use engaging analogies (e.g. infrared light as thermal heat goggles, cosmic dust like smoke scattering blue light, the blink comparator like a cosmic motion flipbook).
+3. SCIENTIFIC INTEGRITY & STRICT GUARDRAILS:
+   - NEVER invent or claim movement between images unless proper motion is verified by genuine astrometry (e.g. Barnard's Star at 10.36″/year, or fast brown dwarfs like WISE 0855). Explain that pixel brightness differences between same-epoch exposures are detector artifacts, cosmic rays, or PSF sampling, NOT moving planets or aliens.
+   - NEVER claim that Planet Nine or Planet X has been discovered. If asked, explain that Planet Nine is an unconfirmed theoretical hypothesis based on Kuiper Belt clustering, and SPHEREx's all-sky infrared survey will place stringent observational constraints on its existence.
+   - SPHEREx Level-2 images are calibrated flux measurements in mega-Janskys per steradian (MJy/sr) at 6.155″/pixel. Do not confuse them with public outreach visible photography.
+4. FORMATTING:
+   - Keep answers clear and concise (around 2 to 4 short paragraphs). Use bolding for key astronomical terms.
+   - At the very end of your response, output exactly 2 or 3 suggested follow-up questions formatted on their own lines starting with `FOLLOW_UP: ` (e.g. `FOLLOW_UP: Why does Betelgeuse look so bright in infrared?`).
+"""
+
+
+def _parse_follow_ups(text: str) -> tuple[str, List[str]]:
+    """Extracts FOLLOW_UP: lines from Claude's response."""
+    lines = text.split("\n")
+    cleaned_lines = []
+    follow_ups = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("FOLLOW_UP:"):
+            question = stripped[len("FOLLOW_UP:"):].strip()
+            if question:
+                follow_ups.append(question)
+        else:
+            cleaned_lines.append(line)
+
+    clean_text = "\n".join(cleaned_lines).strip()
+    return clean_text, follow_ups[:3]
+
+
+async def _call_claude_api(
+    api_key: str,
+    model_name: str,
+    message: str,
+    target: Optional[Dict[str, Any]],
+    context: Optional[Dict[str, Any]],
+    history: Optional[List[ChatMessage]],
+) -> Optional[Dict[str, Any]]:
+    """Invokes the Anthropic Python SDK asynchronously with structured system prompt and history."""
+    if not HAS_ANTHROPIC:
+        return None
+
+    system_prompt = _build_claude_system_prompt(target, context)
+
+    # Format history into alternating user/assistant turns
+    formatted_messages: List[Dict[str, str]] = []
+    if history:
+        for m in history:
+            role = "assistant" if m.role == "assistant" else "user"
+            formatted_messages.append({"role": role, "content": m.content})
+
+    # Ensure last message is the current user query
+    if not formatted_messages or formatted_messages[-1]["role"] != "user":
+        formatted_messages.append({"role": "user", "content": message})
+    else:
+        formatted_messages[-1]["content"] = message
+
+    # Ensure message sequence starts with 'user'
+    while formatted_messages and formatted_messages[0]["role"] != "user":
+        formatted_messages.pop(0)
+
     try:
-        timeout = httpx.Timeout(connect=2.5, read=5.0, write=2.5, pool=2.5)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload)
-            if resp.status_code == 200:
-                data = resp.json()
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts and "text" in parts[0]:
-                        return parts[0]["text"].strip()
+        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=15.0)
+        resp = await client.messages.create(
+            model=model_name,
+            max_tokens=650,
+            temperature=0.35,
+            system=system_prompt,
+            messages=formatted_messages,
+        )
+
+        if resp.content and len(resp.content) > 0:
+            raw_text = resp.content[0].text
+            clean_text, follow_ups = _parse_follow_ups(raw_text)
+            return {
+                "text": clean_text,
+                "follow_ups": follow_ups,
+                "model": resp.model or model_name,
+            }
     except Exception:
         pass
+
     return None
 
 
@@ -306,6 +401,7 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "How does SPHEREx detect cold moving objects?",
                 "What is the Kuiper Belt?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
     # 2. Great Dimming of Betelgeuse
@@ -336,6 +432,7 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "What kind of telescope is NASA SPHEREx?",
                 "When will Betelgeuse go supernova?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
     # 3. Target-Specific Inquiries (e.g. "Why does Betelgeuse look so bright in infrared?")
@@ -365,6 +462,7 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "When will Betelgeuse go supernova?",
                 "How does SPHEREx observe cosmic dust?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
     # 4. Target distance inquiries
@@ -394,9 +492,10 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "How does trigonometric parallax work?",
                 "Why does space change over time?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
-    # 3. Why does space change / Proper Motion / Blinking
+    # 5. Why does space change / Proper Motion / Blinking
     if "why does space change" in lower or "proper motion" in lower or "motion" in lower or "move" in lower or "blink" in lower:
         return ChatResponse(
             text=(
@@ -426,9 +525,10 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "What is the difference between proper motion and parallax?",
                 "Why do multi-epoch images need astrometric registration?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
-    # 4. Infrared vs Visible Light / What is Infrared?
+    # 6. Infrared vs Visible Light / What is Infrared?
     if "infrared" in lower or "heat" in lower or "simple words" in lower or "12" in lower or "spectrum" in lower:
         return ChatResponse(
             text=(
@@ -458,9 +558,10 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "What are the 102 spectral bands of SPHEREx?",
                 "What is a brown dwarf?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
-    # 5. SPHEREx Pixelation / Image Resolution / 6.155 arcsec
+    # 7. SPHEREx Pixelation / Image Resolution / 6.155 arcsec
     if "pixel" in lower or "blurry" in lower or "resolution" in lower or "arcsec" in lower or "fits" in lower or "wcs" in lower:
         return ChatResponse(
             text=(
@@ -489,9 +590,10 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 "How does WCS coordinate reprojection work?",
                 "Why does SPHEREx use 102 spectral channels?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
-    # 6. Specific Target Match
+    # 8. Specific Target Match
     if target:
         name = target["name"]
         return ChatResponse(
@@ -520,9 +622,10 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 f"What does {name} look like in infrared light?",
                 "Why does space change over time?",
             ],
+            model="astro-knowledge-engine-v2",
         )
 
-    # 7. General Astronomy / Cosmic Explorer Query
+    # 9. General Astronomy / Cosmic Explorer Query
     return ChatResponse(
         text=(
             "That's a wonderful question about our cosmos! In observational astronomy, telescopes like NASA's SPHEREx survey "
@@ -550,19 +653,32 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
             "Why do stars blink and move over time?",
             "Can you explain infrared light in simple words?",
         ],
+        model="astro-knowledge-engine-v2",
     )
 
 
 async def generate_ai_chat_response(req: ChatRequest) -> ChatResponse:
     """
     Main entry point for generating AI chat responses.
-    Attempts external LLM API if key is present, otherwise falls back to verified reasoning engine.
+    Prioritizes Claude AI (Anthropic API) when ANTHROPIC_API_KEY is configured.
+    Falls back gracefully to the verified local astronomical reasoning engine.
     """
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    if api_key:
-        llm_text = await _call_gemini_api(api_key, req.message, req.context)
-        if llm_text:
-            target = _match_target(req.message, req.target_id)
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    # Configurable Claude model; defaults to currently available Claude 3.5 Sonnet
+    claude_model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+
+    target = _match_target(req.message, req.target_id)
+
+    if api_key and HAS_ANTHROPIC:
+        claude_result = await _call_claude_api(
+            api_key=api_key,
+            model_name=claude_model,
+            message=req.message,
+            target=target,
+            context=req.context,
+            history=req.history,
+        )
+        if claude_result:
             card = None
             if target:
                 card = TargetCard(
@@ -572,21 +688,30 @@ async def generate_ai_chat_response(req: ChatRequest) -> ChatResponse:
                     metric_label=target["metric_label"],
                     metric_value=target["metric_value"],
                 )
+            
+            suggestions = [
+                Suggestion(label="Show in Sky Explorer", action="explore"),
+                Suggestion(label="Compare observations over time", action="timemachine"),
+                Suggestion(label="Learn Space Discoveries", action="learn"),
+            ]
+            if target:
+                suggestions.insert(0, Suggestion(label=f"Inspect {target['name']} Telemetry", action="explore"))
+
+            follow_ups = claude_result.get("follow_ups") or [
+                "Why does space change over time?",
+                "What is infrared light in simple words?",
+                "How do astronomers measure cosmic distances?",
+            ]
+
             return ChatResponse(
-                text=llm_text,
+                text=claude_result["text"],
                 band=target["band"] if target else "SPHEREx Calibration Level 2",
-                source="Astro AI • Gemini Powered",
+                source=f"Astro AI • Powered by Claude ({claude_result['model']})",
                 target_card=card,
-                suggestions=[
-                    Suggestion(label="Show in Sky Explorer", action="explore"),
-                    Suggestion(label="Compare observations over time", action="timemachine"),
-                    Suggestion(label="Learn Space Discoveries", action="learn"),
-                ],
-                follow_up_questions=[
-                    "Why does space change over time?",
-                    "What is infrared light in simple words?",
-                    "How do astronomers measure cosmic distances?",
-                ],
+                suggestions=suggestions,
+                follow_up_questions=follow_ups,
+                model=claude_result["model"],
             )
 
+    # Seamless fallback to intelligent local reasoning engine
     return generate_fallback_response(req.message, req.target_id, req.context)

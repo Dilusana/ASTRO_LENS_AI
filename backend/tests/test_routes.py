@@ -8,7 +8,7 @@ import sys, os, asyncio
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from fastapi import HTTPException
 
 from app.main import spherex_observations, spherex_preview, spherex_preview_meta, spherex_compare, ai_chat
@@ -396,13 +396,41 @@ def test_spherex_compare_error():
 
 
 def test_ai_chat_route(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    from app.main import ai_rate_limiter
+    ai_rate_limiter.reset()
+
+    mock_request = MagicMock()
+    mock_request.client.host = "127.0.0.1"
+
     req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
-    result = asyncio.run(ai_chat(req))
+    result = asyncio.run(ai_chat(req, request=mock_request))
     assert "Betelgeuse" in result.text
     assert result.target_card is not None
     assert result.target_card.title == "Alpha Orionis"
+
+
+def test_ai_chat_rate_limiting():
+    from app.main import ai_rate_limiter
+    ai_rate_limiter.reset()
+
+    mock_request = MagicMock()
+    mock_request.client.host = "192.168.1.100"
+
+    req = ChatRequest(message="What is a red supergiant?", target_id="betelgeuse")
+
+    # Send up to max_requests
+    for _ in range(30):
+        res = asyncio.run(ai_chat(req, request=mock_request))
+        assert res is not None
+
+    # The 31st request should trigger HTTP 429
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(ai_chat(req, request=mock_request))
+    assert exc.value.status_code == 429
+    assert "Rate limit" in exc.value.detail
+
 
 
 
