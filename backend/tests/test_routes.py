@@ -11,7 +11,8 @@ import pytest
 from unittest.mock import patch
 from fastapi import HTTPException
 
-from app.main import spherex_observations, spherex_preview, spherex_preview_meta, spherex_compare
+from app.main import spherex_observations, spherex_preview, spherex_preview_meta, spherex_compare, ai_chat
+from app.ai_service import ChatRequest
 from app.spherex import SpherexError
 from app.fits_service import FitsServiceError
 
@@ -392,5 +393,16 @@ def test_spherex_compare_error():
         asyncio.run(_run())
     assert exc.value.status_code == 502
     assert "Reprojection failed" in exc.value.detail
+
+
+def test_ai_chat_route(monkeypatch):
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
+    result = asyncio.run(ai_chat(req))
+    assert "Betelgeuse" in result.text
+    assert result.target_card is not None
+    assert result.target_card.title == "Alpha Orionis"
+
 
 

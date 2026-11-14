@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
+from .ai_service import ChatRequest, ChatResponse, generate_ai_chat_response
 from .compare_service import compare_two_epochs
 from .fits_service import FitsServiceError, get_or_render_preview
 from .spherex import SpherexError, search_observations
@@ -16,7 +17,7 @@ app.add_middleware(
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -94,3 +95,12 @@ async def spherex_compare(
         return await compare_two_epochs(fits_url_1, fits_url_2, ra, dec, s_deg, interpolation=interp)
     except FitsServiceError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
+@app.post("/api/ai/chat", response_model=ChatResponse)
+async def ai_chat(req: ChatRequest) -> ChatResponse:
+    try:
+        return await generate_ai_chat_response(req)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"AI service error: {exc}") from exc
+

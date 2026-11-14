@@ -45,3 +45,30 @@ export async function fetchSpherexCompare({ fitsUrl1, fitsUrl2, ra, dec, sizeDeg
   }
   return body
 }
+
+export async function fetchAstroAiChat({ message, targetId, context }, signal) {
+  const response = await fetch('/api/ai/chat', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      message,
+      target_id: targetId || null,
+      context: context || null,
+    }),
+    signal,
+  })
+  let body = null
+  try {
+    body = await response.json()
+  } catch {
+    body = null
+  }
+  if (!response.ok) {
+    const detail = body && typeof body.detail === 'string' ? body.detail : null
+    throw new Error(detail || 'The Astro AI service is unavailable.')
+  }
+  return body
+}
+

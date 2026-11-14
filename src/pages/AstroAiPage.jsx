@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { fetchAstroAiChat } from '../lib/spherexApi'
 
 export default function AstroAiPage({
   selectedObject,
@@ -17,6 +18,7 @@ export default function AstroAiPage({
       id: 'msg-2',
       sender: 'ai',
       band: 'SPHEREx Band 3.5 µm',
+      source: 'Astro AI • SPHEREx Synchronized',
       text: 'Great question! Betelgeuse is a cool red supergiant star surrounded by giant clouds of warm cosmic dust. While our eyes only see some of its visible light, NASA’s infrared telescopes like SPHEREx see the warm dust glowing brightly like heat from a cozy campfire in the dark!',
       miniCard: {
         title: 'Alpha Orionis',
@@ -30,12 +32,19 @@ export default function AstroAiPage({
         { label: 'Compare observations over time', action: 'timemachine' },
         { label: 'Explain the 2019 Great Dimming', action: 'dimming' },
       ],
+      followUpQuestions: [
+        'Explain the 2019 Great Dimming',
+        'When will Betelgeuse go supernova?',
+        'How does SPHEREx observe cosmic dust?',
+      ],
     },
   ])
 
   const [inputText, setInputText] = useState('')
   const [speakAloud, setSpeakAloud] = useState(false)
   const [isListening, setIsListening] = useState(false)
+  const [isLoading, setIsLoading] = useState(false)
+  const [speakingMsgId, setSpeakingMsgId] = useState(null)
   const chatBottomRef = useRef(null)
 
   const activeTargetName = selectedObject?.name || 'Betelgeuse'
@@ -51,11 +60,20 @@ export default function AstroAiPage({
   // Auto-scroll chat to bottom
   useEffect(() => {
     chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
+  }, [messages, isLoading])
 
-  function handleSend(queryText) {
+  // Cleanup speech synthesis on unmount
+  useEffect(() => {
+    return () => {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel()
+      }
+    }
+  }, [])
+
+  async function handleSend(queryText) {
     const q = queryText || inputText
-    if (!q.trim()) return
+    if (!q.trim() || isLoading) return
 
     messageCounterRef.current += 1
     const userMsg = {
@@ -67,44 +85,107 @@ export default function AstroAiPage({
 
     setMessages((prev) => [...prev, userMsg])
     setInputText('')
+    setIsLoading(true)
 
-    // Generate verified educational answer
-    setTimeout(() => {
+    try {
+      const response = await fetchAstroAiChat({
+        message: q,
+        targetId: selectedObject?.id || null,
+        context: selectedObject
+          ? {
+              name: selectedObject.name,
+              designation: selectedObject.designation,
+              distance: selectedObject.distance,
+              category: selectedObject.category,
+              ra: selectedObject.ra,
+              dec: selectedObject.dec,
+            }
+          : null,
+      })
+
       messageCounterRef.current += 1
-      const response = generateEducationalResponse(q, selectedObject)
+      const aiMsg = {
+        id: `ai-${messageCounterRef.current}`,
+        sender: 'ai',
+        band: response.band || 'SPHEREx Calibration Level 2',
+        source: response.source || 'Astro AI',
+        text: response.text,
+        miniCard: response.target_card
+          ? {
+              title: response.target_card.title,
+              subtitle: response.target_card.subtitle,
+              imageUrl: response.target_card.image_url,
+              metricLabel: response.target_card.metric_label,
+              metricValue: response.target_card.metric_value,
+            }
+          : null,
+        suggestions: response.suggestions || [],
+        followUpQuestions: response.follow_up_questions || [],
+      }
+
+      setMessages((prev) => [...prev, aiMsg])
+
+      if (speakAloud) {
+        speakText(response.text, aiMsg.id)
+      }
+    } catch {
+      // Graceful offline/client fallback
+      messageCounterRef.current += 1
+      const fallback = generateEducationalResponse(q, selectedObject)
       const aiMsg = {
         id: `ai-${messageCounterRef.current}`,
         sender: 'ai',
         band: 'SPHEREx Calibration Level 2',
-        text: response.text,
-        miniCard: response.miniCard,
-        suggestions: response.suggestions,
+        source: 'Astro AI • Offline Mode',
+        text: fallback.text,
+        miniCard: fallback.miniCard,
+        suggestions: fallback.suggestions,
+        followUpQuestions: fallback.followUpQuestions || [],
       }
       setMessages((prev) => [...prev, aiMsg])
 
       if (speakAloud) {
-        speakText(response.text)
+        speakText(fallback.text, aiMsg.id)
       }
-    }, 600)
-  }
-
-  function speakText(text) {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel()
-      const utterance = new SpeechSynthesisUtterance(text)
-      utterance.rate = 1.0
-      utterance.pitch = 1.05
-      window.speechSynthesis.speak(utterance)
+    } finally {
+      setIsLoading(false)
     }
   }
 
+  function speakText(text, msgId) {
+    if (!('speechSynthesis' in window)) return
+
+    if (speakingMsgId === msgId) {
+      window.speechSynthesis.cancel()
+      setSpeakingMsgId(null)
+      return
+    }
+
+    window.speechSynthesis.cancel()
+    const utterance = new SpeechSynthesisUtterance(text)
+    utterance.rate = 1.0
+    utterance.pitch = 1.05
+
+    utterance.onstart = () => {
+      setSpeakingMsgId(msgId)
+    }
+    utterance.onend = () => {
+      setSpeakingMsgId(null)
+    }
+    utterance.onerror = () => {
+      setSpeakingMsgId(null)
+    }
+
+    window.speechSynthesis.speak(utterance)
+  }
+
   function handleVoiceToggle() {
-    if (!('webkitSpeechRecognition' in window || 'SpeechRecognition' in window)) {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SpeechRecognition) {
       alert('Speech recognition is not natively supported in this browser. Please type your question in the text bar!')
       return
     }
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
     const recognition = new SpeechRecognition()
     recognition.lang = 'en-US'
     recognition.interimResults = false
@@ -140,8 +221,12 @@ export default function AstroAiPage({
       setTimeout(() => {
         window.scrollTo({ top: 900, behavior: 'smooth' })
       }, 150)
+    } else if (sug.action === 'learn') {
+      onNavigate?.('learn')
     } else if (sug.action === 'dimming') {
       handleSend('Explain the 2019 Great Dimming of Betelgeuse in detail.')
+    } else if (sug.label) {
+      handleSend(sug.label)
     }
   }
 
@@ -158,12 +243,14 @@ export default function AstroAiPage({
 
         {/* Voice Enabled Pill */}
         <div className="flex items-center gap-2 rounded-full border border-line bg-panel/60 px-3 py-1 text-xs text-slate-300">
-          <span>🔊</span>
-          <span className="text-[0.72rem]">Voice Enabled • Listen Aloud</span>
+          <span>{speakingMsgId ? '🔊' : '🔈'}</span>
+          <span className="text-[0.72rem]">
+            {speakingMsgId ? 'Speaking Aloud...' : isListening ? 'Listening for speech...' : 'Voice Enabled • Listen Aloud'}
+          </span>
           <div className="flex items-center gap-0.5">
-            <span className="h-2 w-0.5 bg-cyan-400 animate-pulse" />
-            <span className="h-3 w-0.5 bg-cyan-400 animate-pulse delay-75" />
-            <span className="h-1.5 w-0.5 bg-cyan-400 animate-pulse delay-150" />
+            <span className={`h-2 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse' : 'opacity-40'}`} />
+            <span className={`h-3 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-75' : 'opacity-40'}`} />
+            <span className={`h-1.5 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-150' : 'opacity-40'}`} />
           </div>
         </div>
       </div>
@@ -176,11 +263,11 @@ export default function AstroAiPage({
           <div className="absolute -inset-4 rounded-full bg-gradient-to-r from-purple-600/30 via-pink-600/20 to-cyan-500/30 blur-xl" />
 
           {/* The Orb Body */}
-          <div className="relative flex h-28 w-28 items-center justify-center rounded-full border-2 border-purple-400/50 bg-gradient-to-br from-[#1d1238] via-[#0d1429] to-[#040817] shadow-[0_0_50px_rgba(168,85,247,0.5)] animate-orb-glow">
+          <div className={`relative flex h-28 w-28 items-center justify-center rounded-full border-2 border-purple-400/50 bg-gradient-to-br from-[#1d1238] via-[#0d1429] to-[#040817] shadow-[0_0_50px_rgba(168,85,247,0.5)] ${isLoading ? 'animate-pulse scale-105' : 'animate-orb-glow'} transition duration-300`}>
             {/* Expressive Digital Cyan Eyes */}
             <div className="flex items-center gap-3">
-              <span className="h-6 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#22d3ee] animate-eye-blink" />
-              <span className="h-6 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#22d3ee] animate-eye-blink" />
+              <span className={`h-6 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#22d3ee] ${isLoading ? 'animate-ping' : 'animate-eye-blink'}`} />
+              <span className={`h-6 w-2.5 rounded-full bg-cyan-400 shadow-[0_0_12px_#22d3ee] ${isLoading ? 'animate-ping' : 'animate-eye-blink'}`} />
             </div>
 
             {/* Orbiting Sparkle */}
@@ -191,7 +278,7 @@ export default function AstroAiPage({
         <div className="space-y-1.5 max-w-lg mx-auto">
           <div className="inline-flex items-center gap-1.5 text-[0.68rem] font-mono text-cyan-300">
             <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
-            <span>Astro is ready to explore with you</span>
+            <span>{isLoading ? 'Astro is analyzing SPHEREx telemetry...' : 'Astro is ready to explore with you'}</span>
           </div>
           <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">
             Say Hello to Astro
@@ -212,8 +299,9 @@ export default function AstroAiPage({
             <button
               key={idx}
               type="button"
+              disabled={isLoading}
               onClick={() => handleSend(q.query)}
-              className="cursor-pointer rounded-full border border-line bg-panel/60 px-3.5 py-1.5 text-xs text-slate-200 shadow-sm transition hover:border-purple-400/60 hover:bg-purple-950/30 hover:text-white active:scale-95"
+              className="cursor-pointer rounded-full border border-line bg-panel/60 px-3.5 py-1.5 text-xs text-slate-200 shadow-sm transition hover:border-purple-400/60 hover:bg-purple-950/30 hover:text-white active:scale-95 disabled:opacity-50"
             >
               <span className="text-purple-400 mr-1.5">✦</span>
               <span>{q.label}</span>
@@ -223,7 +311,7 @@ export default function AstroAiPage({
       </section>
 
       {/* 4. Chat Message History Thread */}
-      <section className="rounded-2xl border border-line/80 bg-panel/70 p-4 sm:p-6 space-y-6 shadow-2xl backdrop-blur-sm min-h-[360px] max-h-[520px] overflow-y-auto">
+      <section className="rounded-2xl border border-line/80 bg-panel/70 p-4 sm:p-6 space-y-6 shadow-2xl backdrop-blur-sm min-h-[360px] max-h-[540px] overflow-y-auto">
         {messages.map((msg) => {
           if (msg.sender === 'user') {
             return (
@@ -237,6 +325,8 @@ export default function AstroAiPage({
               </div>
             )
           }
+
+          const isSpeakingThis = speakingMsgId === msg.id
 
           return (
             <div key={msg.id} className="flex items-start gap-3 max-w-2xl">
@@ -257,17 +347,21 @@ export default function AstroAiPage({
                   </div>
                   <button
                     type="button"
-                    onClick={() => speakText(msg.text)}
-                    className="cursor-pointer flex items-center gap-1 rounded border border-line bg-panel/80 px-2 py-0.5 text-[0.68rem] text-slate-300 hover:text-white hover:border-cyan-400 transition"
+                    onClick={() => speakText(msg.text, msg.id)}
+                    className={`cursor-pointer flex items-center gap-1.5 rounded border px-2.5 py-0.5 text-[0.68rem] transition ${
+                      isSpeakingThis
+                        ? 'border-cyan-400 bg-cyan-950/60 text-cyan-300 font-bold'
+                        : 'border-line bg-panel/80 text-slate-300 hover:text-white hover:border-cyan-400'
+                    }`}
                   >
-                    <span>🔊</span>
-                    <span>Listen</span>
+                    <span>{isSpeakingThis ? '⏹' : '🔊'}</span>
+                    <span>{isSpeakingThis ? 'Stop' : 'Listen'}</span>
                   </button>
                 </div>
 
                 {/* Message Body */}
                 <div className="rounded-2xl rounded-tl-sm border border-line/80 bg-black/40 p-4 text-xs sm:text-sm text-slate-200 leading-relaxed space-y-3">
-                  <p>{msg.text}</p>
+                  <p className="whitespace-pre-line">{msg.text}</p>
 
                   {/* Embedded Mini-Target Card (if provided) */}
                   {msg.miniCard && (
@@ -284,9 +378,9 @@ export default function AstroAiPage({
                         </div>
                       </div>
                       <div className="text-right border-l border-white/10 pl-3">
-                        <p className="text-[0.6rem] font-mono text-amber-300 uppercase">{msg.miniCard.metricLabel}</p>
+                        <p className="text-[0.6rem] font-mono text-amber-300 uppercase">{msg.miniCard.metricLabel || 'OBSERVATION PARAMETER'}</p>
                         <p className="text-xs font-bold text-white font-mono flex items-center justify-end gap-1">
-                          <span>{msg.metricValue}</span>
+                          <span>{msg.miniCard.metricValue}</span>
                           <span className="text-amber-400">🌡</span>
                         </p>
                       </div>
@@ -295,7 +389,7 @@ export default function AstroAiPage({
 
                   {/* Suggested Next Action Pills */}
                   {msg.suggestions && msg.suggestions.length > 0 && (
-                    <div className="pt-2 border-t border-white/10 flex flex-wrap gap-2">
+                    <div className="pt-2 border-t border-white/10 flex flex-wrap items-center gap-2">
                       <span className="text-[0.65rem] font-mono text-muted self-center">Suggested Next:</span>
                       {msg.suggestions.map((sug, i) => (
                         <button
@@ -309,11 +403,45 @@ export default function AstroAiPage({
                       ))}
                     </div>
                   )}
+
+                  {/* Follow-up Questions Chips */}
+                  {msg.followUpQuestions && msg.followUpQuestions.length > 0 && (
+                    <div className="pt-1 flex flex-wrap items-center gap-1.5">
+                      <span className="text-[0.62rem] font-mono text-cyan-300 mr-1">✦ Ask Follow-up:</span>
+                      {msg.followUpQuestions.map((fq, idx) => (
+                        <button
+                          key={idx}
+                          type="button"
+                          disabled={isLoading}
+                          onClick={() => handleSend(fq)}
+                          className="cursor-pointer text-[0.65rem] text-slate-300 hover:text-white bg-purple-950/30 hover:bg-purple-900/40 border border-purple-500/20 px-2 py-0.5 rounded-full transition"
+                        >
+                          {fq} →
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
           )
         })}
+
+        {/* Loading Indicator when awaiting AI response */}
+        {isLoading && (
+          <div className="flex items-start gap-3 max-w-md">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-purple-400 bg-purple-950/80 text-purple-300 shadow-[0_0_12px_rgba(168,85,247,0.4)] animate-pulse">
+              <span className="text-xs">✨</span>
+            </div>
+            <div className="rounded-2xl rounded-tl-sm border border-line/80 bg-black/40 px-4 py-3 text-xs text-slate-300 flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full bg-cyan-400 animate-bounce" />
+              <span className="h-2 w-2 rounded-full bg-purple-400 animate-bounce delay-100" />
+              <span className="h-2 w-2 rounded-full bg-pink-400 animate-bounce delay-200" />
+              <span className="ml-1 text-[0.7rem] font-mono text-cyan-300">Astro is consulting NASA SPHEREx data...</span>
+            </div>
+          </div>
+        )}
+
         <div ref={chatBottomRef} />
       </section>
 
@@ -333,8 +461,9 @@ export default function AstroAiPage({
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="Ask Astro anything about the universe..."
-              className="w-full rounded-xl bg-transparent py-2 pl-9 pr-4 text-xs sm:text-sm text-ink placeholder:text-muted focus:outline-none"
+              placeholder={isListening ? 'Listening to your microphone... speak now!' : 'Ask Astro anything about the universe...'}
+              disabled={isLoading}
+              className="w-full rounded-xl bg-transparent py-2 pl-9 pr-4 text-xs sm:text-sm text-ink placeholder:text-muted focus:outline-none disabled:opacity-60"
             />
           </div>
 
@@ -368,7 +497,8 @@ export default function AstroAiPage({
           {/* Send Button */}
           <button
             type="submit"
-            className="cursor-pointer flex items-center gap-1.5 rounded-xl border border-pink-500/40 bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-md transition hover:scale-105 active:scale-95"
+            disabled={isLoading || !inputText.trim()}
+            className="cursor-pointer flex items-center gap-1.5 rounded-xl border border-pink-500/40 bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-md transition hover:scale-105 active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
           >
             <span>Send</span>
             <span>▷</span>
@@ -410,6 +540,10 @@ function generateEducationalResponse(query, target) {
         { label: 'Show in Sky Explorer', action: 'explore' },
         { label: 'Compare observations over time', action: 'timemachine' },
       ],
+      followUpQuestions: [
+        'How does parallax measurement work?',
+        'Why does space change over time?',
+      ],
     }
   }
 
@@ -419,6 +553,10 @@ function generateEducationalResponse(query, target) {
       suggestions: [
         { label: 'Open Sky Time Machine', action: 'timemachine' },
         { label: 'Inspect Barnard’s Star', action: 'explore' },
+      ],
+      followUpQuestions: [
+        'How fast is Barnard’s Star moving?',
+        'How does the blink comparator work?',
       ],
     }
   }
@@ -430,6 +568,10 @@ function generateEducationalResponse(query, target) {
         { label: 'Explore the Sky', action: 'explore' },
         { label: 'Learn Space Discoveries', action: 'learn' },
       ],
+      followUpQuestions: [
+        'What are the 102 spectral channels of SPHEREx?',
+        'Why does Betelgeuse glow in infrared?',
+      ],
     }
   }
 
@@ -438,6 +580,10 @@ function generateEducationalResponse(query, target) {
       text: 'SPHEREx has a 20-centimeter aperture designed for wide all-sky spectroscopy, not narrow high-magnification portraits. Its detector scale is 6.155 arcseconds per pixel with an optical point-spread function of ~7.5″. Each pixel represents authentic calibrated scientific flux in mega-Janskys per steradian!',
       suggestions: [
         { label: 'Inspect FITS in Time Machine', action: 'timemachine' },
+      ],
+      followUpQuestions: [
+        'What does MJy/sr mean?',
+        'What is WCS astrometric reprojection?',
       ],
     }
   }
@@ -454,6 +600,10 @@ function generateEducationalResponse(query, target) {
     suggestions: [
       { label: 'Show in Sky Explorer', action: 'explore' },
       { label: 'Compare observations over time', action: 'timemachine' },
+    ],
+    followUpQuestions: [
+      'What are the 102 spectral bands of SPHEREx?',
+      'Why does space change over time?',
     ],
   }
 }
