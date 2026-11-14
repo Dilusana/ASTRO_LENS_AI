@@ -4,17 +4,22 @@
   --font-sans: 'Outfit', ui-sans-serif, system-ui, sans-serif;
   --font-display: 'Instrument Serif', Georgia, serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
-  --color-void: #070b14;
-  --color-panel: #10192a;
-  --color-ink: #e8eef8;
+  --color-void: #050814;
+  --color-panel: #0d1527;
+  --color-card: #101c33;
+  --color-ink: #f0f4fc;
   --color-muted: #8ea0bb;
-  --color-line: rgb(186 210 255 / 0.16);
-  --color-brass: #e4c27a;
-  --color-glint: #9fd7ff;
+  --color-line: rgb(186 210 255 / 0.12);
+  --color-brass: #f59e0b;
+  --color-glint: #38bdf8;
+  --color-cosmic-purple: #8b5cf6;
+  --color-cosmic-pink: #ec4899;
+  --color-cosmic-cyan: #06b6d4;
 }
 
 html {
-  background: var(--color-void);
+  background: #050814;
+  color-scheme: dark;
 }
 
 body {
@@ -23,14 +28,15 @@ body {
   color: var(--color-ink);
   font-family: var(--font-sans);
   background:
-    radial-gradient(circle at 12% 8%, rgb(159 215 255 / 0.08), transparent 26%),
-    radial-gradient(circle at 88% 0%, rgb(228 194 122 / 0.08), transparent 22%),
-    radial-gradient(1px 1px at 8% 18%, rgb(255 255 255 / 0.55), transparent),
+    radial-gradient(circle at 15% 10%, rgb(139 92 246 / 0.12), transparent 35%),
+    radial-gradient(circle at 85% 15%, rgb(6 182 212 / 0.10), transparent 30%),
+    radial-gradient(circle at 50% 60%, rgb(236 72 153 / 0.05), transparent 40%),
+    radial-gradient(1px 1px at 8% 18%, rgb(255 255 255 / 0.6), transparent),
     radial-gradient(1px 1px at 22% 72%, rgb(255 255 255 / 0.4), transparent),
-    radial-gradient(1px 1px at 68% 24%, rgb(255 255 255 / 0.45), transparent),
+    radial-gradient(1px 1px at 68% 24%, rgb(255 255 255 / 0.5), transparent),
     radial-gradient(1px 1px at 84% 64%, rgb(255 255 255 / 0.35), transparent),
-    radial-gradient(1px 1px at 46% 40%, rgb(255 255 255 / 0.3), transparent),
-    var(--color-void);
+    radial-gradient(1.5px 1.5px at 46% 40%, rgb(255 255 255 / 0.45), transparent),
+    #050814;
 }
 
 #root {
@@ -40,3 +46,47 @@ body {
 .font-display {
   font-family: var(--font-display);
 }
+
+/* Pulsing and glowing animations for Astro AI and Interactive Canvas */
+@keyframes orbGlow {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 45px rgba(139, 92, 246, 0.45), 0 0 90px rgba(6, 182, 212, 0.25);
+  }
+  50% {
+    transform: scale(1.03);
+    box-shadow: 0 0 65px rgba(139, 92, 246, 0.65), 0 0 120px rgba(6, 182, 212, 0.4);
+  }
+}
+
+@keyframes eyeBlink {
+  0%, 90%, 100% {
+    transform: scaleY(1);
+  }
+  95% {
+    transform: scaleY(0.1);
+  }
+}
+
+@keyframes soundWave {
+  0%, 100% {
+    height: 6px;
+  }
+  50% {
+    height: 18px;
+  }
+}
+
+.animate-orb-glow {
+  animation: orbGlow 4s ease-in-out infinite;
+}
+
+.animate-eye-blink {
+  animation: eyeBlink 4s ease-in-out infinite;
+}
+
+.soundwave-bar:nth-child(1) { animation: soundWave 1.2s ease-in-out infinite 0.1s; }
+.soundwave-bar:nth-child(2) { animation: soundWave 1.2s ease-in-out infinite 0.3s; }
+.soundwave-bar:nth-child(3) { animation: soundWave 1.2s ease-in-out infinite 0.5s; }
+.soundwave-bar:nth-child(4) { animation: soundWave 1.2s ease-in-out infinite 0.2s; }
+
