@@ -12,7 +12,7 @@ from unittest.mock import patch, MagicMock
 from fastapi import HTTPException
 
 from app.main import spherex_observations, spherex_preview, spherex_preview_meta, spherex_compare, ai_chat
-from app.ai_service import ChatRequest
+from app.ai_service import ChatRequest, ChatResponse
 from app.spherex import SpherexError
 from app.fits_service import FitsServiceError
 
@@ -419,17 +419,19 @@ def test_ai_chat_rate_limiting():
     mock_request.client.host = "192.168.1.100"
 
     req = ChatRequest(message="What is a red supergiant?", target_id="betelgeuse")
+    mock_chat_resp = ChatResponse(text="Mocked AI response")
 
-    # Send up to max_requests
-    for _ in range(30):
-        res = asyncio.run(ai_chat(req, request=mock_request))
-        assert res is not None
+    with patch("app.main.generate_ai_chat_response", return_value=mock_chat_resp):
+        # Send up to max_requests
+        for _ in range(30):
+            res = asyncio.run(ai_chat(req, request=mock_request))
+            assert res is not None
 
-    # The 31st request should trigger HTTP 429
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(ai_chat(req, request=mock_request))
-    assert exc.value.status_code == 429
-    assert "Rate limit" in exc.value.detail
+        # The 31st request should trigger HTTP 429
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(ai_chat(req, request=mock_request))
+        assert exc.value.status_code == 429
+        assert "Rate limit" in exc.value.detail
 
 
 

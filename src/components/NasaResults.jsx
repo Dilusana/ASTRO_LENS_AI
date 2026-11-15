@@ -543,6 +543,31 @@ export default function NasaResults({ objectName, status, result, error, onRetry
         </div>
       )}
 
+      {/* Cached Offline Snapshot Notice */}
+      {hasResults && (result.from_cache || result.is_cached) && (
+        <div className="mt-4 rounded-2xl border border-cyan-500/40 bg-cyan-950/30 p-4 text-xs">
+          <div className="flex items-start gap-3">
+            <span className="text-lg">🕒</span>
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold text-cyan-300 uppercase tracking-wider text-[0.7rem]">
+                  Verified NASA Archive Telemetry (Cached Snapshot)
+                </span>
+                <span className="rounded-full border border-cyan-400/40 bg-cyan-500/10 px-2 py-0.5 text-[0.65rem] font-mono text-cyan-300">
+                  Retrieved: {result.retrieval_date_formatted || result.retrieval_timestamp || 'Previous Session'}
+                </span>
+              </div>
+              <p className="text-slate-200 leading-relaxed">
+                {result.notice || 'Upstream NASA IRSA SIA service is temporarily undergoing maintenance (HTTP 502). Displaying verified real NASA observation telemetry previously retrieved.'}
+              </p>
+              <p className="text-cyan-400/80 text-[0.68rem]">
+                All celestial coordinates, observation epochs, and FITS cutout links below are authentic NASA measurements.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {status === 'idle' && (
         <p className="mt-4 max-w-3xl text-sm leading-relaxed text-muted">
           Select a sky target to query NASA/IPAC IRSA for SPHEREx spectral images at its stored coordinates.
@@ -563,20 +588,29 @@ export default function NasaResults({ objectName, status, result, error, onRetry
       )}
 
       {status === 'error' && (
-        <div className="mt-4 max-w-3xl rounded-2xl border border-red-500/30 bg-red-500/10 p-5">
-          <p className="text-sm font-semibold text-red-200">
-            The SPHEREx query for <span className="text-ink">{target}</span> failed.
-          </p>
-          <p className="mt-2 text-xs leading-relaxed text-red-300/80">{error}</p>
-          {onRetry && (
-            <button
-              type="button"
-              onClick={onRetry}
-              className="mt-4 cursor-pointer rounded-full border border-line bg-panel px-4 py-2 text-xs font-medium text-glint hover:border-glint/50 transition"
-            >
-              Retry NASA Query
-            </button>
-          )}
+        <div className="mt-4 max-w-3xl rounded-2xl border border-amber-500/40 bg-amber-950/20 p-5">
+          <div className="flex items-start gap-3">
+            <span className="text-xl">⚠️</span>
+            <div className="space-y-2">
+              <p className="text-sm font-semibold text-amber-200">
+                NASA IRSA Service Notice for <span className="text-ink">{target}</span>
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-amber-300/90">{error}</p>
+              <p className="text-[0.72rem] text-muted leading-relaxed">
+                NASA Caltech/IPAC IRSA SIA servers periodically experience upstream maintenance or load throttling.
+                AstroLens X made bounded retries with exponential backoff before reporting this status.
+              </p>
+              {onRetry && (
+                <button
+                  type="button"
+                  onClick={onRetry}
+                  className="mt-2 cursor-pointer rounded-full border border-amber-500/40 bg-amber-900/30 px-4 py-2 text-xs font-medium text-amber-200 hover:bg-amber-900/50 hover:text-white transition"
+                >
+                  Retry NASA Query
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       )}
 

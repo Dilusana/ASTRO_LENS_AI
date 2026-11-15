@@ -253,3 +253,91 @@ def test_public_observation_keeps_dates():
     pub = _public_observation(obs)
     assert "observation_start" in pub
     assert "observation_end" in pub
+
+
+# --- Sanitizer, Caching, and Retries ----------------------------------------
+
+from app.spherex import (
+    _sanitize_error_snippet,
+    _get_cached_observation,
+    _save_cached_observation,
+    _angular_separation_deg,
+    search_observations,
+)
+
+
+def test_sanitize_error_snippet_502_html():
+    raw_html = (
+        '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN"><html><head>'
+        '<title>502 Proxy Error</title></head><body><h1>Proxy Error</h1>'
+        '<p>Reason: <strong>Error reading from remote server</strong></p></body></html>'
+    )
+    msg = _sanitize_error_snippet(502, raw_html)
+    assert "<" not in msg
+    assert ">" not in msg
+    assert "502" in msg
+    assert "temporarily unavailable" in msg
+
+
+def test_sanitize_error_snippet_503_and_504():
+    msg503 = _sanitize_error_snippet(503, "Service Unavailable")
+    assert "503" in msg503
+    assert "maintenance" in msg503.lower() or "overloaded" in msg503.lower()
+
+    msg504 = _sanitize_error_snippet(504, "Gateway Timeout")
+    assert "504" in msg504
+    assert "timed out" in msg504.lower()
+
+
+def test_angular_separation():
+    # Same point -> 0 deg
+    assert _angular_separation_deg(10.0, 20.0, 10.0, 20.0) == pytest.approx(0.0)
+    # 1 deg difference along declination
+    assert _angular_separation_deg(0.0, 0.0, 0.0, 1.0) == pytest.approx(1.0)
+
+
+def test_cached_observation_lookup():
+    # Sirius coordinates
+    cached = _get_cached_observation(101.287155, -16.716116, 0.01)
+    assert cached is not None
+    assert cached["from_cache"] is True
+    assert cached["is_cached"] is True
+    assert "retrieval_timestamp" in cached
+    assert "notice" in cached
+    assert len(cached["observations"]) > 0
+
+
+@pytest.mark.anyio
+async def test_search_observations_serves_cache_when_irsa_502(monkeypatch):
+    """Verify that when IRSA returns 502, search_observations falls back to cached real observations."""
+    import app.spherex
+
+    # Mock _query_collection to raise SpherexError 502
+    async def mock_query_502(*args, **kwargs):
+        raise SpherexError("IRSA returned HTTP 502 for the SPHEREx search.", status_code=502)
+
+    monkeypatch.setattr(app.spherex, "_query_collection", mock_query_502)
+
+    # Andromeda M31 coordinates (which exist in our pre-seeded cache)
+    result = await search_observations(10.684583, 41.26875, 0.01, 80)
+    assert result is not None
+    assert result["from_cache"] is True
+    assert result["count"] > 0
+    assert "notice" in result
+    assert "2026W30_1B" in result["observations"][0]["obs_id"]
+
+
+@pytest.mark.anyio
+async def test_search_observations_raises_when_no_cache_and_502(monkeypatch):
+    """Verify that when coordinates have NO cached data, it raises 502 and never fabricates."""
+    import app.spherex
+
+    async def mock_query_502(*args, **kwargs):
+        raise SpherexError("IRSA returned HTTP 502 for the SPHEREx search.", status_code=502)
+
+    monkeypatch.setattr(app.spherex, "_query_collection", mock_query_502)
+
+    # Random coordinate in the middle of nowhere that has no cache
+    with pytest.raises(SpherexError) as exc_info:
+        await search_observations(359.123456, -89.654321, 0.001, 80)
+    assert exc_info.value.status_code == 502

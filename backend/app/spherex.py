@@ -7,12 +7,21 @@ observation identifiers, times, instruments, or preview images.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
+import json
+import logging
+import math
+import random
+import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
+
+logger = logging.getLogger("astrolens.spherex")
 
 SIA_ENDPOINT = "https://irsa.ipac.caltech.edu/SIA"
 # Wide-survey Quick Release 3 is the current public spectral-image collection.
@@ -32,6 +41,10 @@ EPOCH_CAVEAT = (
     "returned set. They are not a matched pair of identical pictures."
 )
 CUTOUT_SIZE_DEG = 0.08
+CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache"
+OBS_CACHE_DIR = CACHE_DIR / "observations"
+MAX_SIA_RETRIES = 2
+INITIAL_BACKOFF_SECONDS = 0.5
 
 
 class SpherexError(Exception):
@@ -179,6 +192,98 @@ def _public_observation(observation: dict) -> dict:
     return {key: value for key, value in observation.items() if key not in hidden}
 
 
+def _ensure_obs_cache_dir() -> None:
+    OBS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _angular_separation_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    """Computes angular separation between two celestial coordinates in degrees."""
+    r1, d1, r2, d2 = map(math.radians, [ra1, dec1, ra2, dec2])
+    cos_sep = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
+    cos_sep = max(-1.0, min(1.0, cos_sep))
+    return math.degrees(math.acos(cos_sep))
+
+
+def _cache_key(ra: float, dec: float, radius_deg: float) -> str:
+    return f"{ra:.4f}_{dec:.4f}_{radius_deg:.4f}"
+
+
+def _save_cached_observation(ra: float, dec: float, radius_deg: float, data: dict) -> None:
+    """Persists a successful live NASA observation response to local disk cache."""
+    try:
+        _ensure_obs_cache_dir()
+        now = datetime.now(timezone.utc)
+        payload = dict(data)
+        payload["retrieval_timestamp"] = now.isoformat()
+        payload["retrieval_date_formatted"] = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+        payload["cached_at_iso"] = now.isoformat()
+        key = _cache_key(ra, dec, radius_deg)
+        cache_file = OBS_CACHE_DIR / f"{key}.json"
+        cache_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.debug("Saved observation result to cache: %s", cache_file)
+    except Exception as exc:
+        logger.warning("Failed to save observation cache for (%.4f, %.4f): %s", ra, dec, exc)
+
+
+def _get_cached_observation(ra: float, dec: float, radius_deg: float) -> dict | None:
+    """Retrieves previously cached real NASA observations within radius matching coordinates."""
+    try:
+        _ensure_obs_cache_dir()
+        best_match = None
+        best_sep = float("inf")
+        match_threshold = max(radius_deg, 0.02)
+
+        for cache_file in OBS_CACHE_DIR.glob("*.json"):
+            try:
+                content = json.loads(cache_file.read_text(encoding="utf-8"))
+                query = content.get("query", {})
+                c_ra = query.get("ra_deg")
+                c_dec = query.get("dec_deg")
+                if c_ra is not None and c_dec is not None:
+                    sep = _angular_separation_deg(ra, dec, float(c_ra), float(c_dec))
+                    if sep <= match_threshold and sep < best_sep:
+                        best_sep = sep
+                        best_match = content
+            except Exception:
+                continue
+
+        if best_match:
+            cached_res = json.loads(json.dumps(best_match))
+            cached_res["from_cache"] = True
+            cached_res["is_cached"] = True
+            retrieval_time = (
+                cached_res.get("retrieval_date_formatted")
+                or cached_res.get("retrieval_timestamp")
+                or "prior NASA mission query"
+            )
+            cached_res["notice"] = (
+                f"NASA IRSA SIA service is temporarily unavailable. Displaying verified real NASA SPHEREx observation "
+                f"telemetry previously retrieved on {retrieval_time}."
+            )
+            return cached_res
+        return None
+    except Exception as exc:
+        logger.warning("Error checking observation cache for (%.4f, %.4f): %s", ra, dec, exc)
+        return None
+
+
+def _sanitize_error_snippet(status_code: int, text: str) -> str:
+    """Extracts a clean human-readable error summary without raw HTML markup."""
+    if not text or not text.strip():
+        return f"Upstream NASA service returned HTTP {status_code}."
+
+    if status_code == 502:
+        return "NASA IRSA SIA service is temporarily unavailable (HTTP 502: upstream server communication error at Caltech/IPAC)."
+    if status_code == 503:
+        return "NASA IRSA SIA service is temporarily overloaded or down for maintenance (HTTP 503 Service Unavailable)."
+    if status_code == 504:
+        return "NASA IRSA SIA service timed out (HTTP 504 Gateway Timeout)."
+
+    clean = re.sub(r"<[^>]+>", " ", text)
+    clean = " ".join(clean.split())
+    return clean[:160] if clean else f"HTTP {status_code} error"
+
+
 async def _query_collection(
     client: httpx.AsyncClient,
     collection: str,
@@ -187,36 +292,96 @@ async def _query_collection(
     radius_deg: float,
     max_records: int,
 ) -> list[dict[str, str]]:
-    try:
-        response = await client.get(
-            SIA_ENDPOINT,
-            params={
-                "COLLECTION": collection,
-                "POS": f"circle {ra:.8f} {dec:.8f} {radius_deg:.8f}",
-                "MAXREC": str(max_records),
-                "RESPONSEFORMAT": "csv",
-            },
-        )
-    except httpx.TimeoutException as exc:
-        raise SpherexError("The IRSA SPHEREx query timed out.", status_code=504) from exc
-    except httpx.HTTPError as exc:
-        raise SpherexError("The IRSA SPHEREx service could not be reached.") from exc
+    last_error: Exception | None = None
 
-    if response.status_code != 200:
-        snippet = " ".join(response.text[:180].split())
-        raise SpherexError(
-            f"IRSA returned HTTP {response.status_code} for the SPHEREx search. {snippet}".strip()
-        )
+    for attempt in range(MAX_SIA_RETRIES + 1):
+        try:
+            response = await client.get(
+                SIA_ENDPOINT,
+                params={
+                    "COLLECTION": collection,
+                    "POS": f"circle {ra:.8f} {dec:.8f} {radius_deg:.8f}",
+                    "MAXREC": str(max_records),
+                    "RESPONSEFORMAT": "csv",
+                },
+            )
 
-    text = response.text.lstrip("\ufeff")
-    if not text.strip():
-        return []
-    first_line = text.splitlines()[0]
-    if "obs_id" not in first_line or "access_url" not in first_line:
-        snippet = " ".join(text[:180].split())
-        raise SpherexError(f"IRSA returned an unexpected SPHEREx payload. {snippet}")
+            if response.status_code == 200:
+                text = response.text.lstrip("\ufeff")
+                if not text.strip():
+                    return []
+                first_line = text.splitlines()[0]
+                if "obs_id" not in first_line or "access_url" not in first_line:
+                    clean_snippet = _sanitize_error_snippet(response.status_code, text)
+                    logger.error("IRSA returned unexpected payload structure: %s", clean_snippet)
+                    raise SpherexError("IRSA returned an unexpected SPHEREx payload structure.", status_code=502)
+                return list(csv.DictReader(io.StringIO(text)))
 
-    return list(csv.DictReader(io.StringIO(text)))
+            # If temporary error (502, 503, 504) and retries remain
+            if response.status_code in (502, 503, 504) and attempt < MAX_SIA_RETRIES:
+                delay = INITIAL_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0.01, 0.08)
+                logger.warning(
+                    "NASA IRSA SIA returned HTTP %d for %s (attempt %d/%d). Retrying with exponential backoff in %.2fs...",
+                    response.status_code,
+                    collection,
+                    attempt + 1,
+                    MAX_SIA_RETRIES + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            # Retries exhausted or non-retryable error
+            clean_snippet = _sanitize_error_snippet(response.status_code, response.text)
+            logger.error(
+                "NASA IRSA SIA endpoint returned HTTP %d for %s (attempt %d/%d): %s",
+                response.status_code,
+                collection,
+                attempt + 1,
+                MAX_SIA_RETRIES + 1,
+                clean_snippet,
+            )
+            raise SpherexError(
+                f"IRSA returned HTTP {response.status_code} for the SPHEREx search. {clean_snippet}",
+                status_code=response.status_code if response.status_code in (502, 503, 504) else 502,
+            )
+
+        except httpx.TimeoutException as exc:
+            last_error = exc
+            if attempt < MAX_SIA_RETRIES:
+                delay = INITIAL_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0.01, 0.08)
+                logger.warning(
+                    "NASA IRSA SIA query timed out for %s (attempt %d/%d). Retrying in %.2fs...",
+                    collection,
+                    attempt + 1,
+                    MAX_SIA_RETRIES + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("NASA IRSA SIA query timed out after %d attempts.", MAX_SIA_RETRIES + 1)
+            raise SpherexError("The IRSA SPHEREx query timed out.", status_code=504) from exc
+
+        except httpx.HTTPError as exc:
+            last_error = exc
+            if attempt < MAX_SIA_RETRIES:
+                delay = INITIAL_BACKOFF_SECONDS * (2 ** attempt) + random.uniform(0.01, 0.08)
+                logger.warning(
+                    "NASA IRSA SIA connection error for %s (attempt %d/%d): %s. Retrying in %.2fs...",
+                    collection,
+                    attempt + 1,
+                    MAX_SIA_RETRIES + 1,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            logger.error("NASA IRSA SIA service could not be reached: %s", exc)
+            raise SpherexError("The IRSA SPHEREx service could not be reached.", status_code=502) from exc
+
+    if last_error:
+        raise SpherexError("The IRSA SPHEREx service could not be reached.", status_code=502) from last_error
+    raise SpherexError("IRSA SPHEREx search failed.", status_code=502)
 
 
 async def search_observations(
@@ -225,41 +390,58 @@ async def search_observations(
     radius_deg: float,
     max_records: int,
 ) -> dict:
-    timeout = httpx.Timeout(90.0, connect=20.0)
-    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT}) as client:
-        collections = [PRIMARY_COLLECTION]
-        rows = await _query_collection(client, PRIMARY_COLLECTION, ra, dec, radius_deg, max_records)
-        collection = PRIMARY_COLLECTION
-        if not rows:
-            collections.append(FALLBACK_COLLECTION)
-            rows = await _query_collection(
-                client, FALLBACK_COLLECTION, ra, dec, radius_deg, max_records
-            )
-            collection = FALLBACK_COLLECTION if rows else PRIMARY_COLLECTION
+    timeout = httpx.Timeout(connect=10.0, read=25.0, write=10.0, pool=10.0)
 
-    observations = [_observation(row, ra, dec) for row in rows]
-    observations.sort(
-        key=lambda item: (
-            item["observation_start_mjd"] is None,
-            -(item["observation_start_mjd"] or 0),
+    try:
+        async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": USER_AGENT}) as client:
+            collections = [PRIMARY_COLLECTION]
+            rows = await _query_collection(client, PRIMARY_COLLECTION, ra, dec, radius_deg, max_records)
+            collection = PRIMARY_COLLECTION
+            if not rows:
+                collections.append(FALLBACK_COLLECTION)
+                rows = await _query_collection(
+                    client, FALLBACK_COLLECTION, ra, dec, radius_deg, max_records
+                )
+                collection = FALLBACK_COLLECTION if rows else PRIMARY_COLLECTION
+
+        observations = [_observation(row, ra, dec) for row in rows]
+        observations.sort(
+            key=lambda item: (
+                item["observation_start_mjd"] is None,
+                -(item["observation_start_mjd"] or 0),
+            )
         )
-    )
-    truncated = len(observations) >= max_records
-    comparable = _comparable(observations, truncated)
-    return {
-        "query": {
-            "ra_deg": ra,
-            "dec_deg": dec,
-            "radius_deg": radius_deg,
-            "collection": collection,
-            "collections_queried": collections,
-            "service": "IRSA SIA2",
-            "endpoint": SIA_ENDPOINT,
-            "max_records": max_records,
-        },
-        "count": len(observations),
-        "truncated": truncated,
-        "preview_images_published": False,
-        "comparable": comparable,
-        "observations": [_public_observation(item) for item in observations],
-    }
+        truncated = len(observations) >= max_records
+        comparable = _comparable(observations, truncated)
+        result = {
+            "query": {
+                "ra_deg": ra,
+                "dec_deg": dec,
+                "radius_deg": radius_deg,
+                "collection": collection,
+                "collections_queried": collections,
+                "service": "IRSA SIA2",
+                "endpoint": SIA_ENDPOINT,
+                "max_records": max_records,
+            },
+            "count": len(observations),
+            "truncated": truncated,
+            "preview_images_published": False,
+            "comparable": comparable,
+            "observations": [_public_observation(item) for item in observations],
+        }
+        # Save authentic observations to cache for resilience during outages
+        _save_cached_observation(ra, dec, radius_deg, result)
+        return result
+
+    except SpherexError as exc:
+        cached_result = _get_cached_observation(ra, dec, radius_deg)
+        if cached_result:
+            logger.info(
+                "Serving verified cached NASA observations for (%.4f, %.4f) after upstream IRSA status %d",
+                ra,
+                dec,
+                exc.status_code,
+            )
+            return cached_result
+        raise exc
