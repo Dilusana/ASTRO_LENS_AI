@@ -18,10 +18,13 @@ from pydantic import BaseModel, Field
 
 # Load backend/.env if present
 try:
-    from dotenv import load_dotenv
+    from dotenv import load_dotenv, dotenv_values
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
-        load_dotenv(env_path, override=False)
+        vals = dotenv_values(env_path)
+        for k, v in vals.items():
+            if v is not None and v.strip():
+                os.environ[k] = v.strip()
     else:
         load_dotenv()
 except Exception:
@@ -610,6 +613,16 @@ async def _call_claude_api(
         formatted_messages.pop(0)
 
     clean_key = api_key.strip()
+    if clean_key.startswith("apikey_"):
+        logger.warning("Anthropic key appears to be a Key ID ('apikey_...') rather than an API secret key ('sk-ant-api03-...').")
+        return {
+            "error_type": "auth",
+            "error_message": (
+                "The key in backend/.env is an Anthropic Key ID ('apikey_...') rather than an API secret key ('sk-ant-api03-...'). "
+                "In the Anthropic Console (Settings > API Keys), create a new key and copy the full secret key starting with 'sk-ant-api03-'."
+            ),
+        }
+
     is_user_token = clean_key.startswith("sk-ant-usr-")
 
     headers = {

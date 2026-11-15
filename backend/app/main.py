@@ -11,7 +11,14 @@ from fastapi.responses import Response
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 env_file = BACKEND_DIR / ".env"
 if env_file.exists():
-    load_dotenv(env_file, override=False)
+    try:
+        from dotenv import dotenv_values
+        vals = dotenv_values(env_file)
+        for k, v in vals.items():
+            if v is not None and v.strip():
+                os.environ[k] = v.strip()
+    except Exception:
+        load_dotenv(env_file)
 else:
     load_dotenv()
 
