@@ -155,59 +155,67 @@ def test_build_claude_system_prompt_with_context():
     assert "Planet Nine" in prompt
 
 
-def test_claude_api_mock_integration(monkeypatch):
+@pytest.mark.anyio
+async def test_claude_api_mock_integration(monkeypatch):
     """Test full integration with Claude AI via Anthropic Python SDK mock."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-12345")
-    monkeypatch.setenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+    monkeypatch.setenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
 
     mock_result = {
         "success": True,
         "text": "Betelgeuse is an enormous red supergiant star in Orion.",
-        "model": "claude-3-5-sonnet-20241022",
+        "model": "claude-3-5-sonnet-latest",
         "follow_ups": [
             "How big is Betelgeuse compared to the Sun?",
             "When will it explode?",
         ],
     }
 
-    with patch("app.ai_service._call_claude_api", return_value=mock_result):
-        req = ChatRequest(
-            message="Tell me about Betelgeuse",
-            target_id="betelgeuse",
-            context={"observation_count": 80},
-            history=[
-                ChatMessage(role="user", content="Hello Astro!"),
-                ChatMessage(role="assistant", content="Hello! What would you like to explore?"),
-            ],
-        )
-        resp = asyncio.run(generate_ai_chat_response(req))
+    import app.ai_service
+    monkeypatch.setattr(app.ai_service, "_call_claude_api", AsyncMock(return_value=mock_result))
 
-        assert isinstance(resp, ChatResponse)
-        assert "enormous red supergiant" in resp.text
-        assert "claude-3-5-sonnet-20241022" in resp.source
-        assert resp.target_card is not None
-        assert resp.target_card.title == "Alpha Orionis"
-        assert len(resp.follow_up_questions) == 2
-        assert "How big is Betelgeuse" in resp.follow_up_questions[0]
+    req = ChatRequest(
+        message="Tell me about Betelgeuse",
+        target_id="betelgeuse",
+        context={"observation_count": 80},
+        history=[
+            ChatMessage(role="user", content="Hello Astro!"),
+            ChatMessage(role="assistant", content="Hello! What would you like to explore?"),
+        ],
+    )
+    resp = await app.ai_service.generate_ai_chat_response(req)
+
+    assert isinstance(resp, ChatResponse)
+    assert "enormous red supergiant" in resp.text
+    assert "claude-3-5-sonnet-latest" in resp.source
+    assert resp.target_card is not None
+    assert resp.target_card.title == "Alpha Orionis"
+    assert len(resp.follow_up_questions) == 2
+    assert "How big is Betelgeuse" in resp.follow_up_questions[0]
 
 
-def test_claude_fallback_on_api_error(monkeypatch):
+@pytest.mark.anyio
+async def test_claude_fallback_on_api_error(monkeypatch):
     """Verify that if Anthropic API throws an exception, it seamlessly falls back to local reasoning."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-invalid")
 
-    with patch("app.ai_service._call_claude_api", return_value={"error_type": "timeout", "error_message": "Anthropic API request timed out (15s limit)."}):
-        req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
-        resp = asyncio.run(generate_ai_chat_response(req))
-        assert isinstance(resp, ChatResponse)
-        assert "Betelgeuse" in resp.text
-        assert resp.target_card is not None
+    import app.ai_service
+    timeout_result = {"error_type": "timeout", "error_message": "Anthropic API request timed out (15s limit)."}
+    monkeypatch.setattr(app.ai_service, "_call_claude_api", AsyncMock(return_value=timeout_result))
+
+    req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
+    resp = await app.ai_service.generate_ai_chat_response(req)
+    assert isinstance(resp, ChatResponse)
+    assert "Betelgeuse" in resp.text
+    assert resp.target_card is not None
 
 
-def test_async_generate_ai_chat_response_fallback(monkeypatch):
+@pytest.mark.anyio
+async def test_async_generate_ai_chat_response_fallback(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     req = ChatRequest(message="How far away is Barnard's Star?", target_id="barnards-star")
-    resp = asyncio.run(generate_ai_chat_response(req))
+    resp = await generate_ai_chat_response(req)
     assert isinstance(resp, ChatResponse)
     assert "Barnard" in resp.text
     assert "5.96 Light-Years" in resp.target_card.subtitle

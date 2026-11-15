@@ -21,7 +21,7 @@ try:
     from dotenv import load_dotenv
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
-        load_dotenv(env_path)
+        load_dotenv(env_path, override=True)
     else:
         load_dotenv()
 except Exception:
@@ -488,14 +488,28 @@ async def _call_claude_api(
     while formatted_messages and formatted_messages[0]["role"] != "user":
         formatted_messages.pop(0)
 
-    try:
-        client = anthropic.AsyncAnthropic(api_key=api_key, timeout=15.0)
-        resp = await client.messages.create(
+    clean_key = api_key.strip()
+    is_user_token = clean_key.startswith("sk-ant-usr-")
+
+    async def _send_request(use_auth_token: bool):
+        if use_auth_token:
+            cl = anthropic.AsyncAnthropic(auth_token=clean_key, timeout=15.0)
+        else:
+            cl = anthropic.AsyncAnthropic(api_key=clean_key, timeout=15.0)
+        return await cl.messages.create(
             model=model_name,
             max_tokens=700,
             system=system_prompt,
             messages=formatted_messages,
         )
+
+    try:
+        try:
+            resp = await _send_request(use_auth_token=is_user_token)
+        except anthropic.AuthenticationError:
+            # If the initial token mode gave AuthenticationError, try alternate auth mode
+            logger.info("Retrying with alternate Anthropic auth header mode...")
+            resp = await _send_request(use_auth_token=not is_user_token)
 
         if resp.content and len(resp.content) > 0:
             raw_text = resp.content[0].text
@@ -973,7 +987,7 @@ async def generate_ai_chat_response(req: ChatRequest) -> ChatResponse:
     and falls back cleanly with helpful notifications if credentials/network are constrained.
     """
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    claude_model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+    claude_model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
 
     # Validate and sanitize context against backend reference catalog
     validated_context = _validate_context(req.target_id, req.context)

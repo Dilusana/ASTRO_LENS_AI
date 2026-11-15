@@ -1,8 +1,19 @@
+import os
 import time
 from collections import defaultdict
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+
+# Ensure environment variables are loaded securely from the backend directory
+BACKEND_DIR = Path(__file__).resolve().parent.parent
+env_file = BACKEND_DIR / ".env"
+if env_file.exists():
+    load_dotenv(env_file, override=True)
+else:
+    load_dotenv()
 
 from .ai_service import ChatRequest, ChatResponse, generate_ai_chat_response
 from .compare_service import compare_two_epochs
