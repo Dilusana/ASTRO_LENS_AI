@@ -11,7 +11,7 @@ from fastapi.responses import Response
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 env_file = BACKEND_DIR / ".env"
 if env_file.exists():
-    load_dotenv(env_file, override=True)
+    load_dotenv(env_file, override=False)
 else:
     load_dotenv()
 

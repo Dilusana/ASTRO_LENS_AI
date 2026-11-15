@@ -22,6 +22,11 @@ from app.ai_service import (
 )
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 def test_chat_request_validation():
     req = ChatRequest(message="Why is Betelgeuse bright in infrared?", target_id="betelgeuse")
     assert req.message == "Why is Betelgeuse bright in infrared?"
@@ -221,6 +226,110 @@ async def test_async_generate_ai_chat_response_fallback(monkeypatch):
     assert "5.96 Light-Years" in resp.target_card.subtitle
 
 
+def test_greeting_intent_does_not_dump_selected_star():
+    """Verify that saying 'hiiii' or 'hello' returns a warm short greeting and NEVER dumps Betelgeuse facts."""
+    resp = generate_fallback_response("hiiii", "betelgeuse", None)
+    assert isinstance(resp, ChatResponse)
+    assert "Heyyy" in resp.text or "Astro" in resp.text
+    assert "Betelgeuse is a massive red supergiant" not in resp.text
+    assert resp.target_card is None
+
+
+def test_casual_conversation_intent():
+    """Verify casual chit-chat returns friendly assistant responses without star dumping."""
+    resp_how = generate_fallback_response("how are you", "betelgeuse", None)
+    assert "stellar" in resp_how.text.lower() or "astro" in resp_how.text.lower()
+    assert "Betelgeuse is a massive red supergiant" not in resp_how.text
+
+    resp_who = generate_fallback_response("who are you", "betelgeuse", None)
+    assert "Astro" in resp_who.text
+    assert resp_who.target_card is None
+
+
+def test_tamil_response_intent():
+    """Verify requests in Tamil or asking for Tamil return authentic Tamil text."""
+    resp_tamil = generate_fallback_response("explain it in Tamil", "betelgeuse", None)
+    assert "வணக்கம்" in resp_tamil.text or "அகச்சிவப்பு" in resp_tamil.text
+
+
+def test_observation_comparison_guardrails():
+    """Verify that observation comparison does not fabricate motion for stationary stars."""
+    resp = generate_fallback_response(
+        message="what changed between these observations?",
+        target_id="betelgeuse",
+        context={"bands": "3.5 µm", "repeat_coverage_found": True, "span_days": 180.0},
+    )
+    assert "no confirmed physical displacement" in resp.text.lower() or "no physical displacement" in resp.text.lower()
+
+    # But Barnard's Star reports real verified proper motion
+    resp_barnard = generate_fallback_response(
+        message="what changed between these observations?",
+        target_id="barnards-star",
+        context={"bands": "1.6 µm", "repeat_coverage_found": True, "span_days": 1200.0},
+    )
+    assert "proper motion" in resp_barnard.text.lower()
+    assert "Barnard's Star" in resp_barnard.text
+
+
+def test_user_required_six_queries():
+    """
+    Test the 6 user-specified evaluation queries:
+    1. 'Hi, how are you?' -> natural friendly casual reply, not Betelgeuse facts
+    2. 'What is Betelgeuse?' -> accurate Betelgeuse facts + TargetCard
+    3. 'Explain black holes in simple words.' -> beginner-friendly black hole explanation (no cookie distraction)
+    4. 'Which stars has NASA SPHEREx recently observed?' -> lists Betelgeuse, Barnard's Star, WISE 0855, Sirius, Vega
+    5. 'Explain the Andromeda Galaxy in Tamil.' -> fluent Tamil explanation of Andromeda / Messier 31
+    6. 'What was my previous question?' -> recalls last user question from history
+    """
+    # 1. Hi, how are you?
+    resp1 = generate_fallback_response("Hi, how are you?", target_id="betelgeuse")
+    assert "stellar" in resp1.text.lower() or "astro" in resp1.text.lower()
+    assert "massive red supergiant" not in resp1.text.lower()
+
+    # 2. What is Betelgeuse?
+    resp2 = generate_fallback_response("What is Betelgeuse?", target_id="betelgeuse")
+    assert "betelgeuse" in resp2.text.lower()
+    assert "red supergiant" in resp2.text.lower()
+    assert resp2.target_card is not None
+    assert resp2.target_card.title == "Alpha Orionis"
+
+    # 3. Explain black holes in simple words.
+    resp3 = generate_fallback_response("Explain black holes in simple words.", target_id="betelgeuse")
+    assert "black hole" in resp3.text.lower()
+    assert "gravity" in resp3.text.lower()
+    assert "event horizon" in resp3.text.lower()
+    assert "cookies" not in resp3.text.lower()  # ensured no warm cookies diversion
+
+    # 4. Which stars has NASA SPHEREx recently observed?
+    resp4 = generate_fallback_response("Which stars has NASA SPHEREx recently observed?", target_id=None)
+    assert "betelgeuse" in resp4.text.lower()
+    assert "barnard" in resp4.text.lower()
+    assert "wise 0855" in resp4.text.lower()
+    assert resp4.target_card is not None
+
+    # 5. Explain the Andromeda Galaxy in Tamil.
+    resp5 = generate_fallback_response("Explain the Andromeda Galaxy in Tamil.", target_id=None)
+    assert "வணக்கம்" in resp5.text
+    assert "ஆண்ட்ரோமிடா" in resp5.text or "விண்மீன்" in resp5.text
+    assert "2.5" in resp5.text  # distance 2.5 million light years
+
+    # 6. What was my previous question?
+    hist = [
+        ChatMessage(role="user", content="Explain black holes in simple words."),
+        ChatMessage(role="assistant", content="A black hole is like a cosmic trapdoor..."),
+    ]
+    resp6 = generate_fallback_response("What was my previous question?", target_id=None, history=hist)
+    assert "Explain black holes in simple words." in resp6.text
+
+
+def test_spherex_rag_retrieval():
+    """Verify official NASA/IPAC RAG citations for SPHEREx spectroscopy questions."""
+    from app.spherex_rag import search_spherex_rag
+    results = search_spherex_rag("what is SPHEREx 102 spectral bands and spectrophotometry")
+    assert len(results) > 0
+    assert "https://irsa.ipac.caltech.edu" in results[0]["source_url"]
+
+
 if __name__ == "__main__":
     class MockMonkeyPatch:
         def __init__(self):
@@ -229,6 +338,8 @@ if __name__ == "__main__":
             os.environ[key] = value
         def delenv(self, key, raising=False):
             os.environ.pop(key, None)
+        def setattr(self, target, name, value):
+            setattr(target, name, value)
 
     mp = MockMonkeyPatch()
     test_chat_request_validation()
@@ -241,7 +352,12 @@ if __name__ == "__main__":
     test_pixel_resolution_explanation()
     test_parse_follow_ups()
     test_build_claude_system_prompt_with_context()
-    test_claude_api_mock_integration(mp)
-    test_claude_fallback_on_api_error(mp)
-    test_async_generate_ai_chat_response_fallback(mp)
-    print("All 13 test_ai_service assertions PASSED!")
+    test_greeting_intent_does_not_dump_selected_star()
+    test_casual_conversation_intent()
+    test_tamil_response_intent()
+    test_observation_comparison_guardrails()
+    test_spherex_rag_retrieval()
+    asyncio.run(test_claude_api_mock_integration(mp))
+    asyncio.run(test_claude_fallback_on_api_error(mp))
+    asyncio.run(test_async_generate_ai_chat_response_fallback(mp))
+    print("All 18 test_ai_service assertions PASSED!")

@@ -1,6 +1,63 @@
 import { useState, useRef, useEffect } from 'react'
 import { fetchAstroAiChat } from '../lib/spherexApi'
 
+function renderFormattedMessage(text) {
+  if (!text) return null
+  const paragraphs = text.split('\n\n')
+  return paragraphs.map((para, pIdx) => {
+    const parts = []
+    let lastIndex = 0
+    const regex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g
+    let match
+
+    while ((match = regex.exec(para)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push(para.substring(lastIndex, match.index))
+      }
+      if (match[1] && match[2]) {
+        parts.push(
+          <a
+            key={`link-${pIdx}-${match.index}`}
+            href={match[2]}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-cyan-400 hover:text-cyan-300 underline font-medium inline-flex items-center gap-0.5"
+          >
+            <span>{match[1]}</span>
+            <span className="text-[0.65rem]">↗</span>
+          </a>
+        )
+      } else if (match[3]) {
+        parts.push(
+          <strong key={`bold-${pIdx}-${match.index}`} className="font-semibold text-white">
+            {match[3]}
+          </strong>
+        )
+      }
+      lastIndex = regex.lastIndex
+    }
+    if (lastIndex < para.length) {
+      parts.push(para.substring(lastIndex))
+    }
+
+    return (
+      <p key={pIdx} className="whitespace-pre-line leading-relaxed">
+        {parts}
+      </p>
+    )
+  })
+}
+
+function cleanTextForSpeech(raw) {
+  if (!raw) return ''
+  return raw
+    .replace(/https?:\/\/\S+/g, '') // strip URLs
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1') // keep link anchor text only
+    .replace(/[*_#`~>]/g, '') // remove markdown symbols
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 export default function AstroAiPage({
   selectedObject,
   archiveData,
@@ -10,33 +67,15 @@ export default function AstroAiPage({
   const messageCounterRef = useRef(100)
   const [messages, setMessages] = useState([
     {
-      id: 'msg-1',
-      sender: 'user',
-      text: 'Why does Betelgeuse look so bright in infrared?',
-      time: '2 mins ago',
-    },
-    {
-      id: 'msg-2',
+      id: 'msg-welcome',
       sender: 'ai',
-      band: 'SPHEREx Band 3.5 µm',
+      band: 'SPHEREx Calibration Level 2',
       source: 'Astro AI • SPHEREx Synchronized',
-      text: 'Great question! Betelgeuse is a cool red supergiant star surrounded by giant clouds of warm cosmic dust. While our eyes only see some of its visible light, NASA’s infrared telescopes like SPHEREx see the warm dust glowing brightly like heat from a cozy campfire in the dark!',
-      miniCard: {
-        title: 'Alpha Orionis',
-        subtitle: 'Distance: ~642.5 Light-Years',
-        imageUrl: 'https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg',
-        metricLabel: 'THERMAL HEAT PEAK',
-        metricValue: '3,600 K',
-      },
-      suggestions: [
-        { label: 'Show in Sky Explorer', action: 'explore' },
-        { label: 'Compare observations over time', action: 'timemachine' },
-        { label: 'Explain the 2019 Great Dimming', action: 'dimming' },
-      ],
+      text: "Hey there! 👋 I'm Astro, your cosmic guide. Ask me anything about the universe, NASA's SPHEREx mission, or the celestial targets in the night sky!",
       followUpQuestions: [
-        'Explain the 2019 Great Dimming',
-        'When will Betelgeuse go supernova?',
-        'How does SPHEREx observe cosmic dust?',
+        'What is SPHEREx?',
+        'Why does Betelgeuse look different in infrared?',
+        "Can you explain this like I'm 10?",
       ],
     },
   ])
@@ -76,6 +115,28 @@ export default function AstroAiPage({
     }
   }, [])
 
+  function handleResetChat() {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel()
+    }
+    setSpeakingMsgId(null)
+    setErrorNotice(null)
+    setMessages([
+      {
+        id: `msg-welcome-${Date.now()}`,
+        sender: 'ai',
+        band: 'SPHEREx Calibration Level 2',
+        source: 'Astro AI • SPHEREx Synchronized',
+        text: "Hey there! 👋 Chat history cleared. I'm Astro, your cosmic guide! What would you like to explore together?",
+        followUpQuestions: [
+          'What is SPHEREx?',
+          `Why does ${activeTargetName} look different in infrared?`,
+          "Can you explain this like I'm 10?",
+        ],
+      },
+    ])
+  }
+
   async function handleSend(queryText) {
     const q = queryText || inputText
     if (!q.trim() || isLoading) return
@@ -113,7 +174,7 @@ export default function AstroAiPage({
       } : {}),
     }
 
-    // Prepare multi-turn conversational history
+    // Prepare bounded multi-turn conversational history (last 8 turns)
     const history = messages
       .filter((m) => m.text)
       .map((m) => ({
@@ -197,7 +258,8 @@ export default function AstroAiPage({
     }
 
     window.speechSynthesis.cancel()
-    const utterance = new SpeechSynthesisUtterance(text)
+    const cleanSpokenText = cleanTextForSpeech(text)
+    const utterance = new SpeechSynthesisUtterance(cleanSpokenText)
     utterance.rate = 1.0
     utterance.pitch = 1.05
 
@@ -285,7 +347,7 @@ export default function AstroAiPage({
 
   return (
     <div className="space-y-10 py-4 sm:py-8 max-w-5xl mx-auto px-4">
-      {/* 1. Header Badges */}
+      {/* 1. Header Badges & Action Controls */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4">
         <div className="inline-flex items-center gap-2 rounded-full border border-purple-500/30 bg-purple-950/30 px-3.5 py-1 text-xs text-purple-300">
           <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-pulse" />
@@ -294,30 +356,44 @@ export default function AstroAiPage({
           </span>
         </div>
 
-        {/* Voice Enabled Pill */}
-        <div className="flex items-center gap-2 rounded-full border border-line bg-panel/60 px-3 py-1 text-xs text-slate-300">
-          <span>{speakingMsgId ? '🔊' : '🔈'}</span>
-          <span className="text-[0.72rem]">
-            {speakingMsgId ? 'Speaking Aloud...' : isListening ? 'Listening for speech...' : 'Voice Enabled • Listen Aloud'}
-          </span>
-          <div className="flex items-center gap-0.5">
-            <span className={`h-2 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse' : 'opacity-40'}`} />
-            <span className={`h-3 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-75' : 'opacity-40'}`} />
-            <span className={`h-1.5 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-150' : 'opacity-40'}`} />
+        {/* Right Controls: Reset Chat + Voice Enabled Pill */}
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Reset Chat Button */}
+          <button
+            type="button"
+            onClick={handleResetChat}
+            className="cursor-pointer flex items-center gap-1.5 rounded-full border border-line bg-panel/60 px-3 py-1 text-xs text-slate-300 hover:text-white hover:border-purple-400/50 hover:bg-purple-950/40 transition shadow-sm"
+            title="Reset conversation and start fresh"
+          >
+            <span className="text-purple-400">↺</span>
+            <span className="text-[0.72rem] font-medium">Reset Chat</span>
+          </button>
+
+          {/* Voice Enabled Pill */}
+          <div className="flex items-center gap-2 rounded-full border border-line bg-panel/60 px-3 py-1 text-xs text-slate-300">
+            <span>{speakingMsgId ? '🔊' : '🔈'}</span>
+            <span className="text-[0.72rem]">
+              {speakingMsgId ? 'Speaking Aloud...' : isListening ? 'Listening for speech...' : 'Voice Enabled • Listen Aloud'}
+            </span>
+            <div className="flex items-center gap-0.5">
+              <span className={`h-2 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse' : 'opacity-40'}`} />
+              <span className={`h-3 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-75' : 'opacity-40'}`} />
+              <span className={`h-1.5 w-0.5 bg-cyan-400 ${speakingMsgId || isListening ? 'animate-pulse delay-150' : 'opacity-40'}`} />
+            </div>
+            {speakingMsgId && (
+              <button
+                type="button"
+                onClick={() => {
+                  if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+                  setSpeakingMsgId(null)
+                }}
+                className="ml-1.5 cursor-pointer rounded bg-red-600/90 px-2 py-0.5 text-[0.65rem] font-bold text-white hover:bg-red-500 transition"
+                title="Stop Speech Playback"
+              >
+                ⏹ Stop Speaking
+              </button>
+            )}
           </div>
-          {speakingMsgId && (
-            <button
-              type="button"
-              onClick={() => {
-                if ('speechSynthesis' in window) window.speechSynthesis.cancel()
-                setSpeakingMsgId(null)
-              }}
-              className="ml-1.5 cursor-pointer rounded bg-red-600/90 px-2 py-0.5 text-[0.65rem] font-bold text-white hover:bg-red-500 transition"
-              title="Stop Speech Playback"
-            >
-              ⏹ Stop Speaking
-            </button>
-          )}
         </div>
       </div>
 
@@ -344,7 +420,7 @@ export default function AstroAiPage({
         <div className="space-y-1.5 max-w-lg mx-auto">
           <div className="inline-flex items-center gap-1.5 text-[0.68rem] font-mono text-cyan-300">
             <span className="h-1.5 w-1.5 rounded-full bg-cyan-400" />
-            <span>{isLoading ? 'Astro is analyzing SPHEREx telemetry...' : 'Astro is ready to explore with you'}</span>
+            <span>{isLoading ? 'Astro is consulting NASA SPHEREx data...' : 'Astro is ready to explore with you'}</span>
           </div>
           <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-white">
             Say Hello to Astro
@@ -425,9 +501,11 @@ export default function AstroAiPage({
                   </button>
                 </div>
 
-                {/* Message Body */}
+                {/* Message Body with Formatted Markdown / Links */}
                 <div className="rounded-2xl rounded-tl-sm border border-line/80 bg-black/40 p-4 text-xs sm:text-sm text-slate-200 leading-relaxed space-y-3">
-                  <p className="whitespace-pre-line">{msg.text}</p>
+                  <div className="space-y-2">
+                    {renderFormattedMessage(msg.text)}
+                  </div>
 
                   {/* Embedded Mini-Target Card (if provided) */}
                   {msg.miniCard && (
@@ -601,9 +679,129 @@ export default function AstroAiPage({
 }
 
 function generateEducationalResponse(query, target) {
-  const q = query.toLowerCase()
+  const q = query.toLowerCase().trim()
   const name = target?.name || 'Betelgeuse'
 
+  // 1. Greetings (e.g. "hi", "hiiii", "hello", "hey")
+  if (/^(hi+|hey+|heyy+|hello+|howdy|hola|yo|sup|greetings|good\s+(morning|afternoon|evening))[\s!.,?~:)]*$/i.test(q)) {
+    return {
+      text: "Heyyy! 👋 I'm Astro, your cosmic guide. How's it going? Want to explore the stars, check out NASA SPHEREx infrared data, or just chat about space?",
+      suggestions: [
+        { label: 'What is SPHEREx?', action: 'explore' },
+        { label: 'Explore the Night Sky', action: 'explore' },
+        { label: 'Can you quiz me?', action: 'learn' },
+      ],
+      followUpQuestions: [
+        'What is SPHEREx?',
+        `Why does ${name} look different in infrared?`,
+        "Can you explain this like I'm 10?",
+      ],
+    }
+  }
+
+  // 2. Casual Conversation ("how are you", "who are you", "thank you")
+  if (q.includes('how are you') || q.includes("how's it going") || q.includes('hows it going')) {
+    return {
+      text: "I'm doing stellar! 🚀 Floating through cosmic data streams and ready to explore the infrared universe with you. What's on your mind today?",
+      suggestions: [
+        { label: 'Explore the Night Sky', action: 'explore' },
+        { label: 'Learn Space Discoveries', action: 'learn' },
+      ],
+      followUpQuestions: [
+        'What is NASA SPHEREx?',
+        'Why does the infrared sky look colorful?',
+      ],
+    }
+  }
+
+  if (q.includes('who are you') || q.includes('what are you') || q.includes('what can you do')) {
+    return {
+      text: "I'm Astro, your AI celestial guide for AstroLens X! 🌌 I connect you directly with NASA's SPHEREx mission data, help you decode infrared space observations, and explain cosmic phenomena in plain English.",
+      suggestions: [
+        { label: 'What is SPHEREx?', action: 'explore' },
+        { label: 'Show in Sky Explorer', action: 'explore' },
+      ],
+      followUpQuestions: [
+        'What are the 102 spectral bands of SPHEREx?',
+        'Can you quiz me about astronomy?',
+      ],
+    }
+  }
+
+  if (q.includes('thank') || q.includes('thanks')) {
+    return {
+      text: "You're very welcome! 🌟 Exploring the cosmos is always more exciting together. Let me know if you want to inspect more stars or test your astronomy knowledge!",
+      suggestions: [
+        { label: 'Take an Astronomy Quiz', action: 'learn' },
+        { label: 'Explore the Sky', action: 'explore' },
+      ],
+      followUpQuestions: [
+        'Can you quiz me about this object?',
+        'What is SPHEREx?',
+      ],
+    }
+  }
+
+  // 3. Tamil Language Request (தமிழ்)
+  if (/[\u0B80-\u0BFF]/.test(query) || q.includes('in tamil') || q.includes('tamil')) {
+    return {
+      text: "வணக்கம்! 🌟 நாசாவின் SPHEREx திட்டம் என்பது முழு வானத்தையும் 102 அகச்சிவப்பு (Infrared) அலைவரிசைகளில் வரைபடமாக்கும் ஒரு முன்னோடி விண்வெளித் திட்டமாகும். பிரபஞ்சத்தின் தோற்றம் மற்றும் விண்மீன்கள் பற்றி நீங்கள் என்ன தெரிந்து கொள்ள விரும்புகிறீர்கள்?",
+      suggestions: [
+        { label: 'வானை ஆராயுங்கள் (Explore)', action: 'explore' },
+        { label: 'SPHEREx பற்றி அறிக (Learn)', action: 'learn' },
+      ],
+      followUpQuestions: [
+        'SPHEREx என்றால் என்ன?',
+        'அகச்சிவப்பு ஒளி எவ்வாறு செயல்படுகிறது?',
+      ],
+    }
+  }
+
+  // 4. Proper Motion & Cosmic Change
+  if (q.includes('why does space change') || q.includes('proper motion') || q.includes('motion') || q.includes('move')) {
+    return {
+      text: 'Space looks calm to our eyes, but it is continuously in motion! Nearby stars have high proper motion and race across our field of view, while variable stars pulsate and newborn stars flash as they swallow planetary debris. By comparing two NASA observations taken months or years apart, astronomers spot these changes in an instant!',
+      suggestions: [
+        { label: 'Open Sky Time Machine', action: 'timemachine' },
+        { label: 'Inspect Barnard’s Star', action: 'explore' },
+      ],
+      followUpQuestions: [
+        'How fast is Barnard’s Star moving?',
+        'How does the blink comparator work?',
+      ],
+    }
+  }
+
+  // 5. Infrared Light & Dust Penetration
+  if (q.includes('infrared') || q.includes('12') || q.includes('dust')) {
+    return {
+      text: 'Think of visible light as what your eyes see (like a rainbow), and infrared light as warm heat you feel from a hot mug! Cosmic dust blocks visible starlight, but heat waves slip right through. Telescopes like NASA’s SPHEREx wear infrared glasses to reveal baby stars hidden inside thick clouds!',
+      suggestions: [
+        { label: 'Explore the Sky', action: 'explore' },
+        { label: 'Learn Space Discoveries', action: 'learn' },
+      ],
+      followUpQuestions: [
+        'What are the 102 spectral channels of SPHEREx?',
+        `Why does ${name} glow in infrared?`,
+      ],
+    }
+  }
+
+  // 6. SPHEREx Pixel Scale & Resolution
+  if (q.includes('pixel') || q.includes('blurry') || q.includes('resolution') || q.includes('arcsec')) {
+    return {
+      text: 'SPHEREx has a 20-centimeter aperture designed for wide all-sky spectroscopy, not narrow high-magnification portraits. Its detector scale is 6.155 arcseconds per pixel with an optical point-spread function of ~7.5″. Each pixel represents authentic calibrated scientific flux in mega-Janskys per steradian (MJy/sr)!',
+      suggestions: [
+        { label: 'Inspect FITS in Time Machine', action: 'timemachine' },
+      ],
+      followUpQuestions: [
+        'What does MJy/sr mean?',
+        'What is WCS astrometric reprojection?',
+      ],
+    }
+  }
+
+  // 7. Distance Inquiry (only if target is specifically asked or referenced)
   if (q.includes('how far') || q.includes('distance')) {
     return {
       text: `${name} is located at an estimated distance of ${target?.distance || '642.5 light-years'}. Light traveling from this object began its journey hundreds of years ago before reaching NASA’s detectors! Astronomers calculate this using trigonometric parallax from Gaia and space astrometry.`,
@@ -625,47 +823,23 @@ function generateEducationalResponse(query, target) {
     }
   }
 
-  if (q.includes('why does space change') || q.includes('motion') || q.includes('move')) {
+  // 8. General Astronomy query (when query does NOT explicitly mention the star)
+  if (!q.includes(name.toLowerCase()) && !q.includes('this star') && !q.includes('this object') && !q.includes('this target')) {
     return {
-      text: 'Space looks calm to our eyes, but it is continuously in motion! Nearby stars have high proper motion and race across our field of view, while variable stars pulsate and newborn stars flash as they swallow planetary debris. By comparing two NASA observations taken months or years apart, astronomers spot these changes in an instant!',
+      text: "That's a wonderful question about our cosmos! In observational astronomy, telescopes like NASA's SPHEREx survey the entire sky across 102 individual infrared wavelength channels to explore cosmic inflation, the origins of water in planetary nurseries, and the collective light from ancient galaxies.",
       suggestions: [
-        { label: 'Open Sky Time Machine', action: 'timemachine' },
-        { label: 'Inspect Barnard’s Star', action: 'explore' },
-      ],
-      followUpQuestions: [
-        'How fast is Barnard’s Star moving?',
-        'How does the blink comparator work?',
-      ],
-    }
-  }
-
-  if (q.includes('infrared') || q.includes('12')) {
-    return {
-      text: 'Think of visible light as what your eyes see (like a rainbow), and infrared light as warm heat you feel from a hot mug! Cosmic dust blocks visible starlight, but heat waves slip right through. Telescopes like NASA’s SPHEREx wear infrared glasses to reveal baby stars hidden inside thick clouds!',
-      suggestions: [
-        { label: 'Explore the Sky', action: 'explore' },
+        { label: 'Explore the Night Sky', action: 'explore' },
         { label: 'Learn Space Discoveries', action: 'learn' },
       ],
       followUpQuestions: [
-        'What are the 102 spectral channels of SPHEREx?',
-        'Why does Betelgeuse glow in infrared?',
+        'What is SPHEREx?',
+        'Why does space change over time?',
+        'Can you quiz me about astronomy?',
       ],
     }
   }
 
-  if (q.includes('pixel') || q.includes('blurry') || q.includes('resolution')) {
-    return {
-      text: 'SPHEREx has a 20-centimeter aperture designed for wide all-sky spectroscopy, not narrow high-magnification portraits. Its detector scale is 6.155 arcseconds per pixel with an optical point-spread function of ~7.5″. Each pixel represents authentic calibrated scientific flux in mega-Janskys per steradian!',
-      suggestions: [
-        { label: 'Inspect FITS in Time Machine', action: 'timemachine' },
-      ],
-      followUpQuestions: [
-        'What does MJy/sr mean?',
-        'What is WCS astrometric reprojection?',
-      ],
-    }
-  }
-
+  // 9. Target-Specific Inquiry (when user explicitly references the target)
   return {
     text: `Fascinating observation! In observational astrophysics, ${name} offers crucial data on stellar evolution and interstellar chemistry. NASA's SPHEREx all-sky survey maps this coordinate in 102 individual infrared wavelength channels to measure spectral signatures of water ice, carbon monoxide, and cosmic dust.`,
     miniCard: {

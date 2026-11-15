@@ -1,11 +1,11 @@
 """
 AstroLens X - AI Chat Service
-Integrates Claude AI (Anthropic Python SDK) with the NASA SPHEREx astronomy platform.
+Integrates Claude AI (Anthropic Messages API via HTTPX) with the NASA SPHEREx astronomy platform.
 Reads ANTHROPIC_API_KEY and CLAUDE_MODEL from the backend environment / .env,
 injecting verified celestial target coordinates, SPHEREx observation dates,
 spectral bands, and comparison telemetry into Claude's system prompt.
 Features strict scientific guardrails, visual inspection boundaries, quiz assistance,
-and a robust local astronomical reasoning engine fallback.
+curated NASA SPHEREx RAG knowledge retrieval, and a robust local astronomical reasoning engine fallback.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ try:
     from dotenv import load_dotenv
     env_path = Path(__file__).resolve().parent.parent / ".env"
     if env_path.exists():
-        load_dotenv(env_path, override=True)
+        load_dotenv(env_path, override=False)
     else:
         load_dotenv()
 except Exception:
@@ -30,10 +30,20 @@ except Exception:
 logger = logging.getLogger("astrolens.ai")
 
 try:
-    import anthropic
+    import httpx
     HAS_ANTHROPIC = True
 except ImportError:
     HAS_ANTHROPIC = False
+
+# RAG Knowledge Base import
+try:
+    from .spherex_rag import search_spherex_rag
+except ImportError:
+    try:
+        from app.spherex_rag import search_spherex_rag
+    except ImportError:
+        def search_spherex_rag(q: str, top_k: int = 2):
+            return []
 
 
 class ChatMessage(BaseModel):
@@ -302,14 +312,74 @@ TARGET_FACTS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def _match_target(text: str, target_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Identifies and validates the celestial object referenced in the question or context."""
-    if target_id and target_id in TARGET_FACTS:
-        return TARGET_FACTS[target_id]
+# ── Intent Detection & Classification ─────────────────────────────────────────
 
+GREETING_REGEX = re.compile(
+    r"^(hi+|hey+|heyy+|hello+|howdy|hola|yo|sup|greetings|good\s+(morning|afternoon|evening|day))[\s!.,?~:)]*$",
+    re.IGNORECASE,
+)
+
+CASUAL_PATTERNS = [
+    r"\b(how\s+are\s+you|how's\s+it\s+going|hows\s+it\s+going|how\s+do\s+you\s+do)\b",
+    r"\b(who\s+are\s+you|what\s+are\s+you|what\s+is\s+your\s+name|who\s+made\s+you|who\s+created\s+you)\b",
+    r"\b(what\s+can\s+you\s+do|tell\s+me\s+about\s+yourself|help\s+me)\b",
+    r"\b(thank\s+you|thanks|thx|ty|appreciate\s+it)\b",
+    r"\b(bye|goodbye|see\s+ya|see\s+you|good\s+night)\b",
+]
+
+TAMIL_CHARS_REGEX = re.compile(r"[\u0B80-\u0BFF]")
+TAMIL_REQUEST_REGEX = re.compile(r"\b(in\s+tamil|explain\s+in\s+tamil|speak\s+tamil|tamil\s+please|translate\s+to\s+tamil)\b", re.IGNORECASE)
+
+DEICTIC_TARGET_REGEX = re.compile(
+    r"\b(this\s+star|these\s+stars|this\s+object|these\s+objects|this\s+target|this\s+image|these\s+images|this\s+observation|these\s+observations|"
+    r"how\s+far\s+away\s+is\s+it|how\s+far\s+is\s+it|why\s+does\s+it\s+look|why\s+is\s+it\s+so\s+bright|"
+    r"what\s+am\s+i\s+seeing|quiz\s+me\s+about\s+this|explain\s+this\s+like\s+i'm\s+10|explain\s+this\s+like\s+im\s+10)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_greeting(text: str) -> bool:
+    """Detects simple conversational greetings like 'hi', 'hiiii', 'hello', 'hey'."""
+    return bool(GREETING_REGEX.match(text.strip()))
+
+
+def _is_casual(text: str) -> bool:
+    """Detects friendly casual questions like 'how are you', 'who are you', 'thanks'."""
+    cleaned = text.strip().lower()
+    return any(re.search(pat, cleaned, re.IGNORECASE) for pat in CASUAL_PATTERNS)
+
+
+def _is_tamil(text: str) -> bool:
+    """Detects Tamil script or explicit requests for Tamil language explanation."""
+    return bool(TAMIL_CHARS_REGEX.search(text) or TAMIL_REQUEST_REGEX.search(text))
+
+
+def _is_comparison(text: str) -> bool:
+    """Detects observation comparison and Sky Time Machine questions."""
     lower = text.lower()
+    return any(k in lower for k in ["what changed", "change between", "difference between", "are they moving", "did it move", "blink comparator"])
+
+
+def _match_target(text: str, target_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Identifies if a celestial target is explicitly named in the user query,
+    OR if the query uses deictic reference ('this star', 'how far away is it')
+    pointing to the active target_id.
+    
+    If the user is sending a greeting, casual chat, general science question,
+    or does not reference the target, this returns None to prevent unwanted target hijacking.
+    """
+    lower = text.strip().lower()
+
+    # If message is purely a greeting or casual chat, do NOT associate target
+    if _is_greeting(lower) or _is_casual(lower):
+        return None
+
+    # 1. Direct explicit name match in user message
     for tid, info in TARGET_FACTS.items():
-        if info["name"].lower() in lower or info["title"].lower() in lower or tid in lower:
+        name_lower = info["name"].lower()
+        title_lower = info["title"].lower()
+        if re.search(r"\b" + re.escape(name_lower) + r"\b", lower) or re.search(r"\b" + re.escape(title_lower) + r"\b", lower):
             return info
         if tid == "m31" and ("andromeda" in lower or "messier 31" in lower):
             return info
@@ -317,12 +387,17 @@ def _match_target(text: str, target_id: Optional[str]) -> Optional[Dict[str, Any
             return info
         if tid == "barnards-star" and ("barnard" in lower or "gj 699" in lower):
             return info
-        if tid == "wise-0855" and ("wise" in lower or "brown dwarf" in lower):
+        if tid == "wise-0855" and ("wise 0855" in lower or "wise0855" in lower or "brown dwarf" in lower):
             return info
         if tid == "rw-aurigae" and ("rw aur" in lower or "aurigae" in lower):
             return info
         if tid == "r-draconis" and ("r dra" in lower or "draconis" in lower):
             return info
+
+    # 2. Deictic reference matching ("this star", "how far away is it", "what am I seeing in this NASA image")
+    if target_id and target_id in TARGET_FACTS:
+        if DEICTIC_TARGET_REGEX.search(lower) or "this celestial" in lower or "this system" in lower:
+            return TARGET_FACTS[target_id]
 
     return None
 
@@ -333,9 +408,8 @@ def _validate_context(target_id: Optional[str], raw_context: Optional[Dict[str, 
     Prevents forged or scientifically invalid client assertions from polluting the prompt.
     """
     validated = {}
-    matched = _match_target("", target_id)
-
-    if matched:
+    if target_id and target_id in TARGET_FACTS:
+        matched = TARGET_FACTS[target_id]
         validated["name"] = matched["name"]
         validated["designation"] = matched["title"]
         validated["classification"] = matched["type"]
@@ -351,7 +425,10 @@ def _validate_context(target_id: Optional[str], raw_context: Optional[Dict[str, 
     if raw_context:
         # Extract telemetry metadata safely
         if "observation_count" in raw_context:
-            validated["observation_count"] = int(raw_context["observation_count"])
+            try:
+                validated["observation_count"] = int(raw_context["observation_count"])
+            except (ValueError, TypeError):
+                pass
         elif "count" in raw_context:
             try:
                 validated["observation_count"] = int(raw_context["count"])
@@ -383,17 +460,33 @@ def _validate_context(target_id: Optional[str], raw_context: Optional[Dict[str, 
     return validated
 
 
-def _build_claude_system_prompt(target: Optional[Dict[str, Any]], context: Optional[Dict[str, Any]]) -> str:
-    """Builds the astrophysics grounding system prompt for Claude with strict scientific guardrails."""
+def _build_claude_system_prompt(
+    message: Any = "",
+    target: Optional[Dict[str, Any]] = None,
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Builds the astrophysics grounding system prompt for Claude with strict scientific guardrails and RAG integration."""
+    # Backwards compatibility if called as _build_claude_system_prompt(target, context)
+    if isinstance(message, dict) and context is None:
+        context = target
+        target = message
+        message = ""
+
     target_section = ""
     if target:
         target_section = f"""
-VERIFIED CELESTIAL TARGET CONTEXT:
+CELESTIAL TARGET REFERENCE CONTEXT:
 - Object Name: {target.get('name')} ({target.get('title')})
 - Astrophysical Classification: {target.get('type')}
 - Measured Distance: {target.get('distance')}
 - Physical Telemetry: {target.get('metric_label')} = {target.get('metric_value')}
 - Primary Infrared Bandpass: {target.get('band')}
+[NOTE: The user explicitly referenced this object. Ground your answer in these verified facts.]
+"""
+    else:
+        target_section = """
+CELESTIAL TARGET CONTEXT:
+[No celestial target is being queried. Do NOT introduce or force unprompted star facts (such as Betelgeuse or Orion) into your response.]
 """
 
     context_section = ""
@@ -415,23 +508,51 @@ AUTHENTIC NASA SPHEREx MISSION TELEMETRY:
 - Temporal Separation: {f'{delta_days} days' if delta_days else 'Astronomical Time Baseline'}
 """
 
-    return f"""You are Astro AI, an inspiring, enthusiastic astronomy tutor and celestial guide for AstroLens X, an educational web platform built for the NASA Space Apps Challenge and powered by NASA's SPHEREx mission.
+    # Retrieve relevant official RAG documentation passages
+    rag_passages = search_spherex_rag(str(message), top_k=2) if message else []
+    rag_section = ""
+    if rag_passages:
+        rag_section = "\nVERIFIED RETRIEVED NASA SPHEREx DOCUMENTATION (Official Caltech/IPAC & JPL Missions):\n"
+        for r in rag_passages:
+            rag_section += f"- Source: {r['title']} ({r['source_url']})\n  Passage: {r['passage']}\n"
+
+    return f"""You are Astro AI, an inspiring, friendly, natural conversational astronomy assistant and celestial guide for AstroLens X, an educational web platform built for the NASA Space Apps Challenge and powered by NASA's SPHEREx mission.
 
 {target_section}
 {context_section}
+{rag_section}
+CORE CONVERSATIONAL & LEARNING GUIDELINES:
+1. CONVERSATIONAL ADAPTABILITY & GREETINGS:
+   - For greetings (e.g. 'hi', 'hiiii', 'hello', 'hey', 'good morning'), reply with a short, friendly, enthusiastic greeting in 1-2 sentences (e.g. "Hey there! 👋 I'm Astro, your cosmic guide. How's your day going? Want to explore the stars or check out NASA's SPHEREx infrared data?").
+   - NEVER dump unprompted astronomy lectures or star facts when the user is just saying hello or asking casual questions.
+   - For casual conversation ("how are you", "who are you", "thank you"), be warm, witty, and natural.
+   - For astronomy questions, default to 1–3 clear, engaging sentences for simple questions. Provide deeper detail only when the user asks for in-depth analysis.
 
-CORE TUTOR & LEARNING GUIDELINES:
-1. EXPLAIN FOR LEARNERS: Communicate naturally and warmly in plain English suitable for students (Grade 5 to university undergrad) and the curious public. If asked "Can you explain this like I'm 10?", use vivid playful metaphors (space blankets, heat-vision goggles, baking warm cookies).
-2. VIVID REAL-WORLD ANALOGIES: Use engaging analogies (e.g. infrared light as thermal heat goggles, cosmic dust like smoke scattering blue light, the blink comparator like a cosmic motion flipbook).
-3. QUIZ & ENGAGEMENT: If asked "Can you quiz me about this object?" or "quiz me", create a fun, 3-option multiple choice question (A, B, C) about the current target or astrophysics concept. Await their answer and guide them!
-4. STRICT SCIENTIFIC INTEGRITY & GUARDRAILS:
-   - VISUAL INSPECTION BOUNDARY: You have access to calibrated telemetry, coordinates, wavelengths, dates, and bandpasses, but you do NOT receive raw image pixel matrices or computer vision tensors in this query. NEVER claim that you can visually see shapes, patterns, or anomalies in the image that are not documented in the verified metadata. Always explain what the user is seeing based on the known astrophysical parameters, detector scale (6.155 arcsec/pixel), and spectral bands.
-   - NO FABRICATED MOTION: NEVER invent or claim movement between images unless proper motion is verified by genuine astrometry (e.g. Barnard's Star at 10.36″/year, or fast brown dwarfs like WISE 0855). Explain that pixel brightness differences between same-epoch exposures are detector artifacts, cosmic rays, or PSF sampling, NOT moving planets or aliens.
-   - PLANET NINE GUARDRAIL: NEVER claim that Planet Nine or Planet X has been discovered. If asked, explain that Planet Nine is an unconfirmed theoretical hypothesis based on Kuiper Belt clustering, and SPHEREx's all-sky infrared survey will place stringent observational constraints on its existence.
-   - SPHEREx DATA TRUTH: SPHEREx Level-2 images are calibrated flux measurements in mega-Janskys per steradian (MJy/sr) at 6.155″/pixel. Do not confuse them with public outreach visible photography.
-5. FORMATTING:
-   - Keep answers clear and concise (around 2 to 4 short paragraphs). Use bolding for key astronomical terms.
-   - At the very end of your response, output exactly 2 or 3 suggested follow-up questions formatted on their own lines starting with `FOLLOW_UP: ` (e.g. `FOLLOW_UP: Why does Betelgeuse look so bright in infrared?`).
+2. TARGET RELEVANCE:
+   - Only discuss the celestial target (e.g. Betelgeuse, Sirius, etc.) IF the user specifically asks about it or refers to "this star" / "this object".
+   - If the user asks a general question (e.g. "what is SPHEREx", "how do telescopes work"), do NOT pivot to Betelgeuse.
+
+3. MULTILINGUAL SUPPORT (TAMIL):
+   - If the user asks in Tamil (தமிழ்) or requests a Tamil explanation (e.g. "explain in Tamil", "தமிழில் சொல்லுங்கள்"), respond naturally and fluently in authentic Tamil with accurate astronomical terms.
+
+4. EXPLAIN FOR LEARNERS:
+   - Use vivid real-world analogies (infrared light as heat-vision goggles, cosmic dust like smoke scattering blue light, the blink comparator like a cosmic motion flipbook).
+   - If asked "Can you explain this like I'm 10?", use playful metaphors (space blankets, warm cookies, glowing campfires).
+   - If asked "quiz me", provide a fun 3-option multiple choice question (A, B, C) and await their answer.
+
+5. STRICT SCIENTIFIC INTEGRITY & OBSERVATION GUARDRAILS:
+   - OBSERVATION COMPARISONS: When the user asks "What changed between these observations?":
+     * Consult the verified telemetry above.
+     * If the observations are from the same epoch or single pass, or for distant stationary stars: EXPLICITLY state that the two exposures share the same spectral band and show NO confirmed physical movement or physical transformation; slight brightness variations are due to detector sampling, PSF, or calibration noise, not moving objects.
+     * Only confirm proper motion if the object is verified high proper motion (like Barnard's Star at 10.36″/year or WISE 0855) across verified multi-epoch dates. NEVER invent moving objects, hypothetical planets, or collision events based on brightness differences alone!
+   - NO FABRICATED DISCOVERIES: Planet Nine is an unconfirmed hypothesis. Never claim it has been found.
+   - SPHEREx LEVEL-2 REALITY: SPHEREx data are calibrated spectrophotometric flux measurements in mega-Janskys per steradian (MJy/sr) with 6.155″/pixel scale, not public outreach visible-color photos.
+   - VISUAL BOUNDARY: You do not have raw pixel computer vision; ground all statements in verified metadata.
+
+6. FORMATTING:
+   - Keep answers clear and conversational.
+   - If citing official SPHEREx science or data archives, cite the official source (such as NASA/JPL or Caltech/IPAC IRSA).
+   - At the very end of your response, output exactly 2 or 3 suggested follow-up questions formatted on their own lines starting with `FOLLOW_UP: ` (e.g. `FOLLOW_UP: What are the 102 spectral bands of SPHEREx?`).
 """
 
 
@@ -463,18 +584,18 @@ async def _call_claude_api(
     history: Optional[List[ChatMessage]],
 ) -> Dict[str, Any]:
     """
-    Invokes the Anthropic Python SDK asynchronously with structured system prompt and history.
+    Invokes the Anthropic Messages API asynchronously with structured system prompt and history.
     Captures specific Anthropic exceptions (auth, rate-limit, timeout, bad request).
     """
     if not HAS_ANTHROPIC:
-        return {"error_type": "no_sdk", "error_message": "Anthropic Python SDK not installed."}
+        return {"error_type": "no_sdk", "error_message": "HTTP client not available."}
 
-    system_prompt = _build_claude_system_prompt(target, context)
+    system_prompt = _build_claude_system_prompt(message, target, context)
 
-    # Format history into alternating user/assistant turns
+    # Format history into alternating user/assistant turns (bounded to last 8 turns)
     formatted_messages: List[Dict[str, str]] = []
     if history:
-        for m in history:
+        for m in history[-8:]:
             role = "assistant" if m.role == "assistant" else "user"
             formatted_messages.append({"role": role, "content": m.content})
 
@@ -491,78 +612,392 @@ async def _call_claude_api(
     clean_key = api_key.strip()
     is_user_token = clean_key.startswith("sk-ant-usr-")
 
-    async def _send_request(use_auth_token: bool):
-        if use_auth_token:
-            cl = anthropic.AsyncAnthropic(auth_token=clean_key, timeout=15.0)
-        else:
-            cl = anthropic.AsyncAnthropic(api_key=clean_key, timeout=15.0)
-        return await cl.messages.create(
-            model=model_name,
-            max_tokens=700,
-            system=system_prompt,
-            messages=formatted_messages,
-        )
+    headers = {
+        "x-api-key": clean_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if is_user_token:
+        headers["authorization"] = f"Bearer {clean_key}"
+
+    payload = {
+        "model": model_name,
+        "max_tokens": 700,
+        "system": system_prompt,
+        "messages": formatted_messages,
+    }
+
+    logger.info("Calling Claude API endpoint https://api.anthropic.com/v1/messages with model %s", model_name)
 
     try:
-        try:
-            resp = await _send_request(use_auth_token=is_user_token)
-        except anthropic.AuthenticationError:
-            # If the initial token mode gave AuthenticationError, try alternate auth mode
-            logger.info("Retrying with alternate Anthropic auth header mode...")
-            resp = await _send_request(use_auth_token=not is_user_token)
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+            )
 
-        if resp.content and len(resp.content) > 0:
-            raw_text = resp.content[0].text
-            clean_text, follow_ups = _parse_follow_ups(raw_text)
+            # If initial user token returned 401, retry without Bearer header
+            if resp.status_code == 401 and is_user_token:
+                logger.info("Retrying with alternate Anthropic auth header mode...")
+                headers_alt = {
+                    "x-api-key": clean_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                resp = await client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers_alt,
+                    json=payload,
+                )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                content = data.get("content", [])
+                if content and len(content) > 0:
+                    raw_text = content[0].get("text", "")
+                    clean_text, follow_ups = _parse_follow_ups(raw_text)
+                    return {
+                        "success": True,
+                        "text": clean_text,
+                        "follow_ups": follow_ups,
+                        "model": data.get("model", model_name),
+                    }
+                return {"error_type": "empty_response", "error_message": "Anthropic returned an empty response."}
+
+            if resp.status_code in (401, 403):
+                return {
+                    "error_type": "auth",
+                    "error_message": "Invalid Anthropic API key. To enable live Claude responses, configure a valid key in backend/.env.",
+                }
+            if resp.status_code == 429:
+                return {
+                    "error_type": "rate_limit",
+                    "error_message": "Anthropic API rate limit reached. Please wait a moment.",
+                }
+            if resp.status_code == 400:
+                error_detail = resp.text
+                try:
+                    error_detail = resp.json().get("error", {}).get("message", resp.text)
+                except Exception:
+                    pass
+                return {
+                    "error_type": "bad_request",
+                    "error_message": f"Anthropic request error: {error_detail}",
+                }
             return {
-                "success": True,
-                "text": clean_text,
-                "follow_ups": follow_ups,
-                "model": resp.model or model_name,
+                "error_type": "api_error",
+                "error_message": f"Anthropic API returned status {resp.status_code}: {resp.text}",
             }
-        return {"error_type": "empty_response", "error_message": "Anthropic returned an empty response."}
 
-    except anthropic.AuthenticationError as e:
-        logger.warning(f"Anthropic AuthenticationError: {e}")
-        return {
-            "error_type": "auth",
-            "error_message": "Invalid Anthropic API key. To enable live Claude responses, configure a valid key in backend/.env.",
-        }
-    except anthropic.RateLimitError as e:
-        logger.warning(f"Anthropic RateLimitError: {e}")
-        return {
-            "error_type": "rate_limit",
-            "error_message": "Anthropic API rate limit reached. Please wait a moment.",
-        }
-    except anthropic.BadRequestError as e:
-        logger.warning(f"Anthropic BadRequestError: {e}")
-        return {
-            "error_type": "bad_request",
-            "error_message": f"Anthropic request error: {e.message}",
-        }
-    except anthropic.APITimeoutError as e:
-        logger.warning(f"Anthropic APITimeoutError: {e}")
+    except httpx.TimeoutException:
+        logger.warning("Anthropic API request timed out (15s limit).")
         return {
             "error_type": "timeout",
             "error_message": "Anthropic API request timed out (15s limit).",
         }
     except Exception as e:
-        logger.warning(f"Anthropic generic error: {e}")
+        logger.warning(f"Anthropic connection error: {e}")
         return {
-            "error_type": "general",
-            "error_message": f"Anthropic API connection error: {str(e)}",
+            "error_type": "connection",
+            "error_message": f"Anthropic API connection notice: {str(e)[:180]}",
         }
 
 
-def generate_fallback_response(message: str, target_id: Optional[str], context: Optional[Dict[str, Any]]) -> ChatResponse:
+def generate_fallback_response(
+    message: str,
+    target_id: Optional[str] = None,
+    context: Optional[Dict[str, Any]] = None,
+    history: Optional[List[ChatMessage]] = None,
+) -> ChatResponse:
     """
-    Intelligent astronomical reasoning engine.
-    Produces scientifically rigorous, engaging educational responses without needing external keys.
+    Intelligent astronomical reasoning engine and local fallback.
+    Produces scientifically rigorous, engaging educational responses with intent awareness.
     """
     target = _match_target(message, target_id)
-    lower = message.lower()
+    lower = message.strip().lower()
 
-    # 1. Planet X / Planet Nine / Fake Planet Guardrail
+    # 0. Conversation History Recall (e.g. "What was my previous question?", "What did I ask before?")
+    if any(k in lower for k in ["previous question", "last question", "what did i ask", "asked before", "what was my last"]):
+        prev_user_msgs = []
+        if history:
+            for h in history:
+                if h.role == "user" and h.content.strip():
+                    prev_user_msgs.append(h.content.strip())
+        # If current query is the last one in history, exclude it
+        if prev_user_msgs and prev_user_msgs[-1].lower() == message.strip().lower():
+            prev_user_msgs.pop()
+
+        if prev_user_msgs:
+            last_q = prev_user_msgs[-1]
+            return ChatResponse(
+                text=(
+                    f"Your previous question was:\n\n"
+                    f'> *"{last_q}"*\n\n'
+                    f"We were exploring that topic together! Would you like to dive deeper into it or ask a new astronomy question?"
+                ),
+                band="SPHEREx Conversational Session State",
+                source="Astro AI • Memory Synchronized",
+                suggestions=[
+                    Suggestion(label="Explore More", action="explore"),
+                    Suggestion(label="Ask New Question", action="explore"),
+                ],
+                follow_up_questions=[
+                    "Can you quiz me?",
+                    "What is SPHEREx?",
+                ],
+                model="astro-conversational-engine-v2",
+            )
+        else:
+            return ChatResponse(
+                text=(
+                    "This is the beginning of our chat session! You haven't asked a previous question yet. "
+                    "What cosmic mystery would you like to explore?"
+                ),
+                band="SPHEREx Conversational Session State",
+                source="Astro AI • Memory Synchronized",
+                suggestions=[
+                    Suggestion(label="Explore the Sky", action="explore"),
+                    Suggestion(label="What is SPHEREx?", action="explore"),
+                ],
+                follow_up_questions=[
+                    "What is Betelgeuse?",
+                    "What is SPHEREx?",
+                ],
+                model="astro-conversational-engine-v2",
+            )
+
+    # 1. Greetings (e.g. "hi", "hiiii", "hello", "hey")
+    if _is_greeting(lower):
+        return ChatResponse(
+            text=(
+                "Heyyy! 👋 I'm Astro, your cosmic guide. How's it going? "
+                "Want to explore the stars, check out NASA SPHEREx infrared data, or just chat about space?"
+            ),
+            band="SPHEREx Mission Comm Link",
+            source="Astro AI • Ready to Explore",
+            suggestions=[
+                Suggestion(label="What is SPHEREx?", action="explore"),
+                Suggestion(label="Explore the Night Sky", action="explore"),
+                Suggestion(label="Can you quiz me?", action="quiz"),
+            ],
+            follow_up_questions=[
+                "What is SPHEREx?",
+                "What does infrared light look like?",
+                "Can you explain how stars are born?",
+            ],
+            model="astro-conversational-engine-v2",
+        )
+
+    # 2. Casual Chat ("how are you", "who are you", "thank you", etc.)
+    if _is_casual(lower):
+        if "how are you" in lower or "how's it going" in lower or "hows it going" in lower:
+            return ChatResponse(
+                text="I'm doing stellar! 🚀 Floating through cosmic data streams and ready to explore the infrared universe with you. What's on your mind today?",
+                band="SPHEREx Telemetry Active",
+                source="Astro AI • Conversational Mode",
+                suggestions=[
+                    Suggestion(label="Explore the Night Sky", action="explore"),
+                    Suggestion(label="Learn Space Discoveries", action="learn"),
+                ],
+                follow_up_questions=[
+                    "What is NASA SPHEREx?",
+                    "Why is the infrared sky colorful?",
+                    "Can you quiz me?",
+                ],
+                model="astro-conversational-engine-v2",
+            )
+        if "who are you" in lower or "what are you" in lower or "who made you" in lower or "what can you do" in lower:
+            return ChatResponse(
+                text="I'm Astro, your AI astronomy guide for AstroLens X! 🌌 I connect you directly with NASA's SPHEREx mission data, help you explore stars and galaxies across 102 infrared channels, and explain cosmic mysteries in plain English or Tamil.",
+                band="SPHEREx Mission Architecture",
+                source="Astro AI • Conversational Mode",
+                suggestions=[
+                    Suggestion(label="What is SPHEREx?", action="explore"),
+                    Suggestion(label="Show in Sky Explorer", action="explore"),
+                ],
+                follow_up_questions=[
+                    "What are the 102 spectral bands of SPHEREx?",
+                    "How does infrared vision work?",
+                    "Can you quiz me about astronomy?",
+                ],
+                model="astro-conversational-engine-v2",
+            )
+        if "thank" in lower or "thanks" in lower:
+            return ChatResponse(
+                text="You're very welcome! 🌟 Exploring the cosmos is always more exciting together. Let me know if you want to inspect more stars or test your astronomy knowledge!",
+                band="SPHEREx Comm Channel",
+                source="Astro AI • Conversational Mode",
+                suggestions=[
+                    Suggestion(label="Take an Astronomy Quiz", action="quiz"),
+                    Suggestion(label="Explore the Sky", action="explore"),
+                ],
+                follow_up_questions=[
+                    "Can you quiz me about this object?",
+                    "What is SPHEREx?",
+                ],
+                model="astro-conversational-engine-v2",
+            )
+        # General casual reply
+        return ChatResponse(
+            text="Glad you're here! 🚀 Whether you're curious about red supergiants, distant galaxies, or NASA's SPHEREx all-sky survey, I'm here to explore with you. What would you like to discover?",
+            band="SPHEREx Comm Link",
+            source="Astro AI • Conversational Mode",
+            suggestions=[
+                Suggestion(label="Explore the Night Sky", action="explore"),
+                Suggestion(label="What is SPHEREx?", action="explore"),
+            ],
+            follow_up_questions=[
+                "What is SPHEREx?",
+                "Why do stars look different in infrared?",
+            ],
+            model="astro-conversational-engine-v2",
+        )
+
+    # 3. Tamil Language Request (தமிழ்)
+    if _is_tamil(lower):
+        if any(k in lower for k in ["andromeda", "m31", "messier 31", "galaxy", "திரள்"]) or "ஆண்ட்ரோமிடா" in message:
+            text = (
+                "வணக்கம்! 🌟 **ஆண்ட்ரோமிடா விண்மீன் திரள் (Andromeda Galaxy / Messier 31)** பற்றிய முக்கிய தகவல்கள்:\n\n"
+                "1. **அமைவிடம் & தொலைவு**: ஆண்ட்ரோமிடா என்பது நமது பால்வீதிக்கு (Milky Way) மிக அருகில் உள்ள மாபெரும் சுழல் விண்மீன் திரள் (Spiral Galaxy) ஆகும். இது பூமியிலிருந்து சுமார் 2.5 மில்லியன் ஒளி ஆண்டுகள் (Light-Years) தொலைவில் உள்ளது.\n"
+                "2. **விண்மீன்கள் எண்ணிக்கை**: இதில் சுமார் 1 டிரில்லியனுக்கும் (1,000,000,000,000) அதிகமான நட்சத்திரங்கள் உள்ளன.\n"
+                "3. **எதிர்கால இணைப்பு**: சுமார் 4.5 பில்லியன் ஆண்டுகளில் நமது பால்வீதியும் ஆண்ட்ரோமிடாவும் ஈர்ப்பு விசையால் மோதி இணைந்து 'மில்கோமெடா' (Milkomeda) என்ற புதிய பிரம்மாண்ட விண்மீன் திரளாக மாறும்!\n"
+                "4. **நாசாவின் SPHEREx ஆய்வு**: நாசாவின் SPHEREx தொலைநோக்கி ஆண்ட்ரோமிடாவின் விண்மீன் உருவாக்கப் பகுதிகள் மற்றும் விண்மீன் தூசிகளை 102 அகச்சிவப்பு (Infrared) அலைவரிசைகளில் விரிவாக ஆராய்கிறது."
+            )
+            card = TargetCard(
+                title="Andromeda Galaxy (M31)",
+                subtitle="ஆண்ட்ரோமிடா விண்மீன் திரள்",
+                image_url="https://images-assets.nasa.gov/image/PIA04921/PIA04921~thumb.jpg",
+                metric_label="தொலைவு (DISTANCE)",
+                metric_value="2.5M Light-Years",
+            )
+        elif target:
+            name = target["name"]
+            text = (
+                f"வணக்கம்! 🌟 {name} என்பது நமது விண்வெளியில் மிகவும் புகழ்பெற்ற விண்மீன் பொருளாகும் ({target['type']}). "
+                f"இது பூமியிலிருந்து சுமார் {target['distance']} தொலைவில் அமைந்துள்ளது. "
+                f"நாசாவின் SPHEREx அகச்சிவப்பு (Infrared) தொலைநோக்கி இதன் வெப்பம் மற்றும் விண்மீன் தூசிகளை 102 அலைவரிசைகளில் ஆராய்கிறது."
+            )
+            card = TargetCard(
+                title=target["title"],
+                subtitle=f"தொலைவு: {target['distance']}",
+                image_url=target["image_url"],
+                metric_label=target["metric_label"],
+                metric_value=target["metric_value"],
+            )
+        elif "வணக்கம்" in message:
+            text = "வணக்கம்! 🌟 நான் ஆஸ்ட்ரோ (Astro), உங்கள் விண்வெளி வழிகாட்டி. நாசாவின் SPHEREx தொலைநோக்கி மற்றும் விண்மீன்கள் பற்றி நீங்கள் என்ன தெரிந்து கொள்ள விரும்புகிறீர்கள்?"
+            card = None
+        else:
+            text = (
+                "வணக்கம்! 🌟 நாசாவின் SPHEREx (Spectro-Photometer for the History of the Universe) திட்டம் என்பது "
+                "முழு வானத்தையும் 102 அகச்சிவப்பு (Infrared) அலைவரிசைகளில் வரைபடமாக்கும் ஒரு நவீன விண்வெளித் திட்டமாகும். "
+                "பிரபஞ்சத்தின் தோற்றம், விண்மீன் திரள்களின் உருவாக்கம் மற்றும் கிரகங்களில் உள்ள நீரின் தோற்றத்தை ஆராய இது உதவுகிறது."
+            )
+            card = None
+        return ChatResponse(
+            text=text,
+            band="SPHEREx Tamil Linguistics Engine",
+            source="Astro AI • தமிழ் வழிகாட்டி",
+            target_card=card,
+            suggestions=[
+                Suggestion(label="வானை ஆராயுங்கள் (Explore)", action="explore"),
+                Suggestion(label="SPHEREx பற்றி அறிக (Learn)", action="learn"),
+            ],
+            follow_up_questions=[
+                "SPHEREx என்றால் என்ன?",
+                "அகச்சிவப்பு ஒளி எவ்வாறு செயல்படுகிறது?",
+            ],
+            model="astro-multilingual-engine",
+        )
+
+    # 4. Stars Observed by NASA / SPHEREx (e.g. "Which stars has NASA SPHEREx recently observed?")
+    if any(k in lower for k in [
+        "which star", "what star", "stars observed", "stars has nasa",
+        "stars did nasa", "targets observed", "objects observed",
+        "stars recently observed", "stars does spherex", "stars has spherex",
+        "stars observed by"
+    ]):
+        return ChatResponse(
+            text=(
+                "NASA's SPHEREx mission is designed as an all-sky spectrophotometric survey that systematically observes millions of stars "
+                "across the Milky Way and over 450 million galaxies in 102 infrared wavelength channels (0.75 – 5.0 µm)!\n\n"
+                "Key stars and primary calibration targets featured in NASA and AstroLens X telemetry include:\n"
+                "• **Betelgeuse (Alpha Orionis)**: The iconic red supergiant in Orion, observed in multi-band infrared to study circumstellar dust shells and mass ejection following the 2019 Great Dimming.\n"
+                "• **Barnard's Star (GJ 699)**: The closest single red dwarf (5.96 ly), tracked across multiple epochs for high-precision proper motion (10.36″/year) and kinematic benchmarks.\n"
+                "• **WISE 0855 (WISE J085510.83-071442.5)**: The coldest known sub-stellar brown dwarf outside our solar system (-13°C), observed for atmospheric water-ice cloud spectroscopy.\n"
+                "• **Sirius & Vega**: Bright A-type spectrophotometric flux standards used to anchor absolute photometric calibration.\n"
+                "• **RW Aurigae & R Draconis**: Protoplanetary disk evolution targets and long-period variable pulsating stars.\n\n"
+                "Official NASA Reference: [NASA IRSA SPHEREx Mission Documentation](https://irsa.ipac.caltech.edu/Missions/spherex.html)"
+            ),
+            band="SPHEREx Target Catalog Band 1-6",
+            source="Astro AI • SPHEREx Synchronized",
+            target_card=TargetCard(
+                title="NASA SPHEREx Target Catalog",
+                subtitle="Primary Spectrophotometric Targets",
+                image_url="https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg",
+                metric_label="SURVEY SCOPE",
+                metric_value="All-Sky (102 Channels)",
+            ),
+            suggestions=[
+                Suggestion(label="Inspect Betelgeuse Telemetry", action="explore"),
+                Suggestion(label="Inspect Barnard's Star Motion", action="timemachine"),
+                Suggestion(label="Inspect WISE 0855 Brown Dwarf", action="explore"),
+            ],
+            follow_up_questions=[
+                "What is Betelgeuse?",
+                "How fast does Barnard's Star move?",
+                "Why does SPHEREx use 102 spectral channels?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 5. Black Holes & High-Energy Astrophysics (e.g. "Explain black holes in simple words")
+    if "black hole" in lower or "singularity" in lower or "event horizon" in lower or "sagittarius a*" in lower:
+        if any(k in lower for k in ["simple words", "simple", "kid", "like i'm 10", "like im 10", "easy"]):
+            text = (
+                "A black hole is like the ultimate cosmic trapdoor! 🕳️⭐ It is a place in space where gravity is so strong "
+                "that nothing—not even light—can ever escape once it gets too close.\n\n"
+                "Here is how it works in simple words:\n"
+                "1. **How they form**: When an enormous star runs out of fuel at the end of its life, it collapses inward under its own crushing weight, squeezing all that mass into a tiny point called a **singularity**.\n"
+                "2. **The Point of No Return**: The invisible boundary around a black hole is called the **event horizon**. If anything crosses it, it cannot come back out.\n"
+                "3. **How NASA Sees Them**: The black hole itself is completely dark, but telescopes like NASA's SPHEREx and Webb detect the super-hot glowing gas, dust, and infrared light swirling into it like water down a drain!"
+            )
+        else:
+            text = (
+                "A black hole is an astronomical region of spacetime where gravitational acceleration is so intense that nothing—not even "
+                "electromagnetic radiation such as light—can escape from inside its event horizon.\n\n"
+                "Stellar-mass black holes form when giant stars collapse at the end of their lifecycle, while supermassive black holes "
+                "(millions to billions of solar masses) reside at galactic centers like Sagittarius A* in our Milky Way. "
+                "In infrared surveys like NASA's SPHEREx, astronomers study supermassive black holes by measuring the infrared emission "
+                "from surrounding heated accretion disks and cosmic infrared background (CIB) fluctuations.\n\n"
+                "Official NASA Reference: [NASA JPL SPHEREx Science](https://www.jpl.nasa.gov/press-kits/spherex/mission-overview/science/)"
+            )
+        return ChatResponse(
+            text=text,
+            band="High-Energy Astrophysics Infrared Survey",
+            source="Astro AI • Astrophysics Guardrail",
+            target_card=TargetCard(
+                title="Black Hole Astrophysics",
+                subtitle="Gravitational Singularity & Event Horizon",
+                image_url="https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg",
+                metric_label="ESCAPE VELOCITY",
+                metric_value="> Speed of Light (c)",
+            ),
+            suggestions=[
+                Suggestion(label="Explore the Sky", action="explore"),
+                Suggestion(label="Learn Space Discoveries", action="learn"),
+                Suggestion(label="Can you quiz me?", action="quiz"),
+            ],
+            follow_up_questions=[
+                "What is an event horizon?",
+                "Can anything escape a black hole?",
+                "How does SPHEREx observe black holes?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 6. Planet X / Planet Nine / Fake Planet Guardrail
     if "planet x" in lower or "planet 9" in lower or "planet nine" in lower or "nemesis" in lower:
         return ChatResponse(
             text=(
@@ -595,87 +1030,58 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
             model="astro-knowledge-engine-v2",
         )
 
-    # 2. Quiz Request
+    # 5. Quiz Request
     if "quiz" in lower:
         quiz_text = (
-            target.get("quiz_question")
+            target["quiz_question"]
             if target and "quiz_question" in target
             else (
                 "🌟 Astronomy Quiz: NASA SPHEREx Mission\n\n"
-                "How many individual infrared spectral channels does NASA's SPHEREx space telescope use to map the cosmos?\n\n"
-                "A) 3 RGB filters\n"
-                "B) 102 spectroscopic bands (0.75 to 5.0 µm)\n"
-                "C) 1,000,000 microwave channels\n\n"
-                "What's your answer: A, B, or C?"
+                "How many individual infrared wavelength channels does NASA's SPHEREx telescope map across the entire sky?\n\n"
+                "A) 3 optical bands (Red, Green, Blue)\n"
+                "B) 102 contiguous spectrophotometric bands (0.75 – 5.0 µm)\n"
+                "C) 1,000 ultraviolet bands\n\n"
+                "Type your answer: A, B, or C!"
             )
         )
         return ChatResponse(
             text=quiz_text,
-            band=target["band"] if target else "SPHEREx Education Matrix",
-            source="Astro AI • Space Quiz Lab",
+            band="SPHEREx Interactive Learning Matrix",
+            source="Astro AI • Astrophysics Quiz",
             target_card=TargetCard(
-                title=target["title"] if target else "NASA SPHEREx Survey",
-                subtitle="Cosmic Quiz Master",
+                title=target["title"] if target else "NASA SPHEREx 102 Channels",
+                subtitle=f"Astrophysics Quiz: {target['name']}" if target else "All-Sky Spectrophotometry",
                 image_url=target["image_url"] if target else "https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg",
-                metric_label="DIFFICULTY LEVEL",
-                metric_value="Beginner Friendly",
+                metric_label="CHALLENGE TYPE",
+                metric_value="Multiple Choice",
             ),
             suggestions=[
-                Suggestion(label="Check Answer", action="quiz_check"),
-                Suggestion(label="Explore the Sky", action="explore"),
+                Suggestion(label="Option A", action="quiz_a"),
+                Suggestion(label="Option B", action="quiz_b"),
+                Suggestion(label="Option C", action="quiz_c"),
             ],
             follow_up_questions=[
-                "Give me another quiz question!",
-                "Why does space change over time?",
-                "What is SPHEREx?",
+                "Why does SPHEREx use 102 spectral channels?",
+                "What is infrared light in simple words?",
+                "Can you explain this like I'm 10?",
             ],
             model="astro-knowledge-engine-v2",
         )
 
-    # 3. What is SPHEREx?
-    if "what is spherex" in lower or "about spherex" in lower:
+    # 6. "Explain like I'm 10" / Kid-Friendly Analogy
+    if "like i'm 10" in lower or "like im 10" in lower or "simple words" in lower or "kid" in lower or "easy" in lower:
+        name = target["name"] if target else "a distant star"
         return ChatResponse(
             text=(
-                "SPHEREx (Spectro-Photometer for the History of the Universe, Epoch of Reionization and Ices Explorer) "
-                "is NASA's pioneering all-sky infrared spectral survey mission!\n\n"
-                "Unlike telescopes that take standard color snapshots, SPHEREx captures 102 individual infrared colors "
-                "(wavelengths from 0.75 to 5.0 micrometers) for every single point across the entire night sky. "
-                "Its science goals are monumental: probing cosmic inflation after the Big Bang, tracing the cosmic origin of "
-                "water and biogenic ices in planetary nurseries, and studying the collective light from all galaxies across cosmic time!"
+                f"Imagine you are playing hide-and-seek in a pitch-dark room, but you have superpowers! 🦸‍♂️\n\n"
+                f"Your normal eyes can only see visible light—like the flashlight beam. But cosmic space is full of giant, dusty "
+                f"'space blankets' of smoke that block normal light. That's where NASA’s SPHEREx telescope comes in! It wears "
+                f"special **infrared heat-vision goggles**.\n\n"
+                f"Instead of looking for light, SPHEREx detects **warmth**. Even cold objects like brown dwarfs or warm dust around "
+                f"{name} glow like warm cookies straight out of the oven! That is how astronomers see right through dark space clouds!"
             ),
-            band="102 Spectral Channels (0.75–5.0 µm)",
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title="NASA SPHEREx Observatory",
-                subtitle="All-Sky Spectrophotometry",
-                image_url="https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg",
-                metric_label="SPECTRAL BANDS",
-                metric_value="102 Channels",
-            ),
-            suggestions=[
-                Suggestion(label="Explore the Sky", action="explore"),
-                Suggestion(label="Launch Time Machine", action="timemachine"),
-            ],
-            follow_up_questions=[
-                "Why does SPHEREx use 102 infrared bands?",
-                "How does SPHEREx detect water ice?",
-                "What is a red supergiant?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 4. Explain like I'm 10 / Kid friendly
-    if "like i'm 10" in lower or "like im 10" in lower or "10 year old" in lower or "kid" in lower or "simple words" in lower:
-        name = target["name"] if target else "stars in deep space"
-        return ChatResponse(
-            text=(
-                f"Imagine you are wearing special heat-vision superhero goggles! 👀✨\n\n"
-                f"When you look at {name} with normal human eyes, you only see a fraction of its light because thick clouds "
-                f"of space dust act like smoky fog. But heat waves slip right through smoke without getting stuck! "
-                f"NASA's SPHEREx telescope puts on those heat-vision goggles to spot warm dust glowing like cozy campfires in the deep dark night!"
-            ),
-            band="SPHEREx Kid-Friendly Astronomy",
-            source="Astro AI • Elementary Astronomy",
+            band="Cosmic Heat-Vision Mode",
+            source="Astro AI • Kid-Friendly Science",
             target_card=TargetCard(
                 title=target["title"] if target else "Cosmic Heat Vision",
                 subtitle="Infrared Space Glasses",
@@ -695,17 +1101,36 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
             model="astro-knowledge-engine-v2",
         )
 
-    # 5. What changed between these observations? / Sky Time Machine
-    if "what changed" in lower or "change between" in lower or "difference between" in lower:
+    # 7. What changed between these observations? / Sky Time Machine
+    if _is_comparison(lower):
+        bands = context.get("bands", "SPHEREx Calibration Band") if context else "SPHEREx Multi-Band"
+        delta_days = context.get("span_days") if context else None
+        repeat = context.get("repeat_coverage_found") if context else False
+
+        if target and target["name"] == "Barnard's Star":
+            text = (
+                "In our Sky Time Machine, you are observing Barnard's Star—famous for having the highest known proper motion "
+                "of any star in Earth's sky (10.36 arcseconds per year)!\n\n"
+                "When you toggle the blink comparator between multi-epoch exposures, Barnard's Star noticeably shifts its physical "
+                "coordinates across the detector relative to static distant background stars. This demonstrates real stellar kinematic motion through space!"
+            )
+        elif repeat and delta_days:
+            text = (
+                f"In our Sky Time Machine, these two observations were taken approximately {delta_days:.1f} days apart in spectral band {bands}.\n\n"
+                "Based on verified NASA SPHEREx astrometric telemetry, distant stars show **no confirmed physical displacement or proper motion** "
+                "over this time baseline. Any slight pixel brightness or edge differences between the two frames are due to detector Point Spread "
+                "Function (PSF) sampling and calibration noise—NOT moving planets or physical alterations."
+            )
+        else:
+            text = (
+                f"Based on verified NASA SPHEREx observation telemetry for this coordinate ({bands}), both frames share calibrated Level-2 baseline data.\n\n"
+                "Astronomers look for two genuine phenomena over time: **Proper Motion** (nearby stars physically shifting across the detector) "
+                "and **Stellar Variability** (stars pulsating in temperature and radius). These exposures show **no physical displacement**; "
+                "any visual pixel differences between views reflect display contrast or interpolation filtering (Nearest-Neighbor vs. Bilinear)."
+            )
+
         return ChatResponse(
-            text=(
-                "In our Sky Time Machine, you are comparing two authentic NASA SPHEREx observation epochs! "
-                "Astronomers look for two key physical phenomena across different dates:\n\n"
-                "1. **Proper Motion**: Nearby stars (like Barnard's Star or WISE 0855) physically travel across our field of view. "
-                "When you toggle the blink comparator, nearby stars noticeably jump back and forth relative to static distant background stars!\n\n"
-                "2. **Stellar Variability**: Pulsating stars (like Betelgeuse or Mira variables) fluctuate in physical radius and surface "
-                "temperature, causing their infrared brightness to rise and fall."
-            ),
+            text=text,
             band="Temporal Multi-Epoch Analysis",
             source="Astro AI • SPHEREx Synchronized",
             target_card=TargetCard(
@@ -713,7 +1138,7 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
                 subtitle="Multi-Epoch Comparison",
                 image_url="https://images-assets.nasa.gov/image/PIA22334/PIA22334~thumb.jpg",
                 metric_label="OBSERVATION DELTA",
-                metric_value="Verified Baseline",
+                metric_value=f"{delta_days:.1f} Days" if delta_days else "Verified Baseline",
             ),
             suggestions=[
                 Suggestion(label="Open Sky Time Machine", action="timemachine"),
@@ -727,205 +1152,59 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
             model="astro-knowledge-engine-v2",
         )
 
-    # 6. Great Dimming of Betelgeuse
-    if target and target["name"] == "Betelgeuse" and ("dimming" in lower or "dim" in lower or "supernova" in lower or "explode" in lower):
+    # 8. Proper Motion / Why Space Changes Over Time
+    if "proper motion" in lower or "why does space change" in lower or "change over time" in lower:
         return ChatResponse(
             text=(
+                "Space looks calm to our eyes, but the universe is continuously in motion! Astronomers look for two key physical phenomena:\n\n"
+                "1. **Proper Motion**: Nearby stars race across our field of view. Barnard's Star, for example, moves at 10.36 arcseconds "
+                "per year—meaning when comparing NASA observations taken just a few years apart with a blink comparator, its shift "
+                "against distant background stars is unmistakably visible!\n\n"
+                "2. **Stellar Variability**: Variable stars (like Betelgeuse or Mira variables) fluctuate in physical radius and surface "
+                "temperature, causing their infrared brightness to rise and fall."
+            ),
+            band="Kinematic Astrometry & Proper Motion",
+            source="Astro AI • SPHEREx Synchronized",
+            target_card=TargetCard(
+                title="Stellar Proper Motion",
+                subtitle="Cosmic Kinematics",
+                image_url="https://images-assets.nasa.gov/image/PIA22334/PIA22334~thumb.jpg",
+                metric_label="RECORD HOLDER",
+                metric_value="10.36″ / year (Barnard's Star)",
+            ),
+            suggestions=[
+                Suggestion(label="Inspect Barnard's Star", action="explore"),
+                Suggestion(label="Open Sky Time Machine", action="timemachine"),
+            ],
+            follow_up_questions=[
+                "How does the blink comparator work?",
+                "How fast is Barnard's Star moving?",
+                "Why do variable stars pulse?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 9. Target-Specific Match (when user explicitly asks about the target, e.g. Betelgeuse, distance, infrared radiance)
+    if target:
+        name = target["name"]
+        # Great Dimming check for Betelgeuse
+        if name == "Betelgeuse" and ("dimming" in lower or "dim" in lower or "supernova" in lower or "explode" in lower):
+            text = (
                 f"{target['dimming_fact']}\n\n"
                 "Astronomers confirm that Betelgeuse will eventually end its life as a spectacular Type II supernova, "
                 "lighting up Earth's night sky as bright as the full Moon! However, astrophysics calculations show this will "
                 "likely occur anytime within the next 100,000 years, so there is no immediate danger to Earth."
-            ),
-            band=target["band"],
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title=target["title"],
-                subtitle=f"Distance: {target['distance']}",
-                image_url=target["image_url"],
-                metric_label=target["metric_label"],
-                metric_value=target["metric_value"],
-            ),
-            suggestions=[
-                Suggestion(label="Show in Sky Explorer", action="explore"),
-                Suggestion(label="Compare observations over time", action="timemachine"),
-                Suggestion(label="Inspect SPHEREx Infrared Bands", action="explore"),
-            ],
-            follow_up_questions=[
-                "Why does Betelgeuse look so bright in infrared?",
-                "What kind of telescope is NASA SPHEREx?",
-                "When will Betelgeuse go supernova?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 7. Target-Specific Inquiries (e.g. "Why does Betelgeuse look so bright in infrared?")
-    if target and ("betelgeuse" in lower or target_id == "betelgeuse") and ("bright" in lower or "infrared" in lower or "look" in lower):
-        return ChatResponse(
-            text=(
-                "Great question! Betelgeuse is a cool red supergiant star surrounded by giant clouds of warm cosmic dust. "
-                "While our eyes only see some of its visible light, NASA’s infrared telescopes like SPHEREx see the warm dust "
-                "glowing brightly like heat from a cozy campfire in the dark!"
-            ),
-            band=target["band"],
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title=target["title"],
-                subtitle=f"Distance: {target['distance']}",
-                image_url=target["image_url"],
-                metric_label=target["metric_label"],
-                metric_value=target["metric_value"],
-            ),
-            suggestions=[
-                Suggestion(label="Show in Sky Explorer", action="explore"),
-                Suggestion(label="Compare observations over time", action="timemachine"),
-                Suggestion(label="Explain the 2019 Great Dimming", action="dimming"),
-            ],
-            follow_up_questions=[
-                "Explain the 2019 Great Dimming",
-                "When will Betelgeuse go supernova?",
-                "Can you quiz me about this object?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 8. Target distance inquiries
-    if target and ("how far" in lower or "distance" in lower or "light-year" in lower):
-        return ChatResponse(
-            text=(
-                f"{target['name']} is located at an estimated distance of {target['distance']} from Earth. "
-                f"Light traveling from this celestial object has spent centuries traveling across interstellar space before "
-                f"finally arriving at NASA's detector arrays. Astrophysicists measure these baseline distances using trigonometric "
-                f"parallax from space astrometry missions like Gaia and infrared standard candles."
-            ),
-            band=target["band"],
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title=target["title"],
-                subtitle=f"Distance: {target['distance']}",
-                image_url=target["image_url"],
-                metric_label="PARALLAX DISTANCE",
-                metric_value=target["distance"],
-            ),
-            suggestions=[
-                Suggestion(label="Show in Sky Explorer", action="explore"),
-                Suggestion(label="Compare observations over time", action="timemachine"),
-            ],
-            follow_up_questions=[
-                f"What is {target['name']} made of?",
-                "How does trigonometric parallax work?",
-                "Can you quiz me about this object?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 9. Why does space change / Proper Motion / Blinking
-    if "why does space change" in lower or "proper motion" in lower or "motion" in lower or "move" in lower or "blink" in lower:
-        return ChatResponse(
-            text=(
-                "Space may look frozen when we gaze up at night, but celestial bodies are continuously in motion! "
-                "Nearby stars possess 'proper motion', meaning their genuine physical travel through the galaxy causes them "
-                "to drift across our field of view relative to distant background stars.\n\n"
-                "In our Sky Time Machine, astronomers use a technique pioneered by Clyde Tombaugh: 'blinking' between two "
-                "observations of the same sky coordinate taken months or years apart. Stationary background stars remain pinned "
-                "in place, while nearby high-proper-motion stars (like Barnard's Star or WISE 0855) visibly jump back and forth!"
-            ),
-            band="Astrometric Co-Registration Engine",
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title="Barnard's Star (GJ 699)",
-                subtitle="Fastest Proper Motion Star",
-                image_url="https://images-assets.nasa.gov/image/PIA22334/PIA22334~thumb.jpg",
-                metric_label="PROPER MOTION",
-                metric_value="10.36″ / Year",
-            ),
-            suggestions=[
-                Suggestion(label="Open Sky Time Machine", action="timemachine"),
-                Suggestion(label="Inspect Barnard’s Star", action="explore"),
-                Suggestion(label="Test Proper Motion in Learn Lab", action="learn"),
-            ],
-            follow_up_questions=[
-                "How fast does Barnard's Star travel across the sky?",
-                "What is the difference between proper motion and parallax?",
-                "Can you quiz me about this object?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 10. Infrared vs Visible Light / What is Infrared?
-    if "infrared" in lower or "heat" in lower or "spectrum" in lower:
-        return ChatResponse(
-            text=(
-                "Think of visible light as what your eyes see (like the colors of a rainbow), and infrared light as warm heat "
-                "you feel radiating from a cozy campfire or warm asphalt!\n\n"
-                "In deep space, colossal clouds of cosmic dust act like thick smoke, blocking visible starlight. But infrared waves "
-                "are longer, allowing them to pass right through the dust particles without scattering (governed by Rayleigh scattering, "
-                "where scattering drops by wavelength to the fourth power, λ⁻⁴). That is why NASA's SPHEREx telescope wears infrared "
-                "glasses—to unveil newborn stars, cold brown dwarfs, and water ice hidden inside cosmic nurseries!"
-            ),
-            band="Spectroscopy 0.75 – 5.0 µm",
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title="SPHEREx Mission Payload",
-                subtitle="102 Near-Infrared Bands",
-                image_url="https://images-assets.nasa.gov/image/PIA08653/PIA08653~thumb.jpg",
-                metric_label="SPECTRAL RANGE",
-                metric_value="0.75 – 5.0 µm",
-            ),
-            suggestions=[
-                Suggestion(label="Explore the Sky", action="explore"),
-                Suggestion(label="Learn Space Discoveries", action="learn"),
-                Suggestion(label="Compare Multi-Epoch Images", action="timemachine"),
-            ],
-            follow_up_questions=[
-                "Why can infrared light pass through cosmic dust?",
-                "What are the 102 spectral bands of SPHEREx?",
-                "Can you quiz me about this object?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 11. SPHEREx Pixelation / Image Resolution / 6.155 arcsec
-    if "pixel" in lower or "blurry" in lower or "resolution" in lower or "arcsec" in lower or "fits" in lower or "wcs" in lower:
-        return ChatResponse(
-            text=(
-                "Great observation! SPHEREx is an all-sky surveyor designed to map the entire celestial sphere four times over, "
-                "rather than taking narrow, high-magnification portraits like Hubble or Webb.\n\n"
-                "Its wide-field telescope has a 20 cm aperture with a native pixel scale of 6.155 arcseconds per pixel. Each pixel "
-                "in our viewer is not an aesthetic graphic, but a calibrated scientific measurement of sky surface brightness in "
-                "mega-Janskys per steradian (MJy/sr). In AstroLens X, you can toggle between 'Nearest Neighbor' to inspect raw "
-                "science pixels and 'Bilinear' for smooth educational display!"
-            ),
-            band="WCS Astrometric Projection TAN",
-            source="Astro AI • SPHEREx Synchronized",
-            target_card=TargetCard(
-                title="SPHEREx Pixel Scale",
-                subtitle="Calibrated Level-2 Data",
-                image_url="https://images-assets.nasa.gov/image/PIA18008/PIA18008~thumb.jpg",
-                metric_label="PIXEL SCALE",
-                metric_value="6.155″ / pixel",
-            ),
-            suggestions=[
-                Suggestion(label="Toggle Raw vs Smooth Pixels", action="timemachine"),
-                Suggestion(label="View Science Mode WCS Metrics", action="timemachine"),
-            ],
-            follow_up_questions=[
-                "What does MJy/sr mean in astronomy?",
-                "How does WCS coordinate reprojection work?",
-                "Can you quiz me about this object?",
-            ],
-            model="astro-knowledge-engine-v2",
-        )
-
-    # 12. Specific Target Match
-    if target:
-        name = target["name"]
-        return ChatResponse(
-            text=(
+            )
+        else:
+            text = (
                 f"{target['core_explanation']}\n\n"
                 f"In NASA SPHEREx multi-band telemetry, {name} is observed across multiple epochs to quantify infrared spectral "
                 f"energy distributions (SEDs). Whether tracking interstellar dust chemistry, stellar pulsation, or proper motion shifts, "
                 f"these observations provide astrophysicists with direct empirical constraints on celestial physics."
-            ),
+            )
+
+        return ChatResponse(
+            text=text,
             band=target["band"],
             source="Astro AI • SPHEREx Synchronized",
             target_card=TargetCard(
@@ -943,6 +1222,116 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
             follow_up_questions=[
                 f"How far away is {name} from Earth?",
                 f"What does {name} look like in infrared light?",
+                "Can you quiz me about this object?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 10. Infrared Light / Seeing Through Cosmic Dust (Generic)
+    if "infrared" in lower or "dust" in lower or "heat" in lower or "wavelength" in lower:
+        return ChatResponse(
+            text=(
+                "Visible starlight has very short wavelengths (~0.4 to 0.7 µm) that collide directly with interstellar dust grains, "
+                "scattering the light away and creating dark silhouette clouds in optical telescopes.\n\n"
+                "Infrared light, by contrast, has longer wavelengths (0.75 to 5.0 µm in SPHEREx's detectors). These longer heat waves "
+                "slip smoothly around sub-micron dust particles without scattering! This allows SPHEREx to peer directly into opaque stellar "
+                "nurseries, uncover baby stars forming inside dense molecular cores, and detect the thermal glow of cool objects."
+            ),
+            band="SPHEREx Band 0.75 – 5.0 µm",
+            source="Astro AI • SPHEREx Synchronized",
+            target_card=TargetCard(
+                title="Infrared Wavelength Penetration",
+                subtitle="Scattering vs Absorption Physics",
+                image_url="https://images-assets.nasa.gov/image/PIA14445/PIA14445~thumb.jpg",
+                metric_label="SPECTRAL RANGE",
+                metric_value="0.75 – 5.0 µm",
+            ),
+            suggestions=[
+                Suggestion(label="Explore Infrared Targets", action="explore"),
+                Suggestion(label="What is SPHEREx?", action="explore"),
+                Suggestion(label="Learn How Space Changes", action="learn"),
+            ],
+            follow_up_questions=[
+                "Why can infrared light pass through cosmic dust?",
+                "What are the 102 spectral bands of SPHEREx?",
+                "Can you quiz me about this object?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 11. SPHEREx Mission / 102 Bands / RAG Knowledge Integration
+    rag_matches = search_spherex_rag(message, top_k=2)
+    if "spherex" in lower or "spectrophotometry" in lower or "102 band" in lower or "inflation" in lower or "ice" in lower or "ebl" in lower:
+        if rag_matches:
+            top_passage = rag_matches[0]["passage"]
+            top_url = rag_matches[0]["source_url"]
+            top_title = rag_matches[0]["title"]
+            text = (
+                f"{top_passage}\n\n"
+                f"Official NASA/IPAC Reference: [{top_title}]({top_url})"
+            )
+        else:
+            text = (
+                "NASA's SPHEREx (Spectro-Photometer for the History of the Universe, Epoch of Reionization, and Ices Explorer) "
+                "is an all-sky near-infrared space observatory. It maps the entire sky four times over a two-year mission across "
+                "102 individual spectrophotometric bands between 0.75 and 5.0 µm.\n\n"
+                "SPHEREx answers three grand questions in astrophysics: 1) What drove cosmic inflation after the Big Bang? "
+                "2) How did water and biogenic ices form in planetary nurseries? and 3) What is the total history of galaxy light "
+                "throughout cosmic time?\n\n"
+                "Official Reference: [NASA IRSA SPHEREx Missions](https://irsa.ipac.caltech.edu/Missions/spherex.html)"
+            )
+        return ChatResponse(
+            text=text,
+            band="SPHEREx 102 Channels (0.75 – 5.0 µm)",
+            source="Astro AI • NASA IRSA Grounded",
+            target_card=TargetCard(
+                title="NASA SPHEREx Observatory",
+                subtitle="102-Band Spectrophotometer",
+                image_url="https://images-assets.nasa.gov/image/PIA23646/PIA23646~thumb.jpg",
+                metric_label="SPECTRAL CHANNELS",
+                metric_value="102 Infrared Bands",
+            ),
+            suggestions=[
+                Suggestion(label="Explore the Sky", action="explore"),
+                Suggestion(label="Compare Epochs in Time Machine", action="timemachine"),
+                Suggestion(label="Learn Space Discoveries", action="learn"),
+            ],
+            follow_up_questions=[
+                "What are the three science pillars of SPHEREx?",
+                "How does SPHEREx detect interstellar water ice?",
+                "What is cosmic inflation?",
+            ],
+            model="astro-knowledge-engine-v2",
+        )
+
+    # 12. SPHEREx Pixelation / Image Resolution / 6.155 arcsec
+    if "pixel" in lower or "blurry" in lower or "resolution" in lower or "arcsec" in lower or "fits" in lower or "wcs" in lower:
+        return ChatResponse(
+            text=(
+                "Great observation! SPHEREx is an all-sky surveyor designed to map the entire celestial sphere four times over, "
+                "rather than taking narrow, high-magnification portraits like Hubble or Webb.\n\n"
+                "Its wide-field telescope has a 20 cm aperture with a native pixel scale of 6.155 arcseconds per pixel. Each pixel "
+                "in our viewer is not an aesthetic graphic, but a calibrated scientific measurement of sky surface brightness in "
+                "mega-Janskys per steradian (MJy/sr). In AstroLens X, you can toggle between 'Nearest Neighbor' to inspect raw "
+                "science pixels and 'Bilinear' for smooth educational display!\n\n"
+                "Official Reference: [NASA IRSA SPHEREx Archive](https://irsa.ipac.caltech.edu/spherex-archive-documentation/)"
+            ),
+            band="WCS Astrometric Projection TAN",
+            source="Astro AI • SPHEREx Synchronized",
+            target_card=TargetCard(
+                title="SPHEREx Pixel Scale",
+                subtitle="Calibrated Level-2 Data",
+                image_url="https://images-assets.nasa.gov/image/PIA18008/PIA18008~thumb.jpg",
+                metric_label="PIXEL SCALE",
+                metric_value="6.155″ / pixel",
+            ),
+            suggestions=[
+                Suggestion(label="Toggle Raw vs Smooth Pixels", action="timemachine"),
+                Suggestion(label="View Science Mode WCS Metrics", action="timemachine"),
+            ],
+            follow_up_questions=[
+                "What does MJy/sr mean in astronomy?",
+                "How does WCS coordinate reprojection work?",
                 "Can you quiz me about this object?",
             ],
             model="astro-knowledge-engine-v2",
@@ -968,13 +1357,13 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
         ),
         suggestions=[
             Suggestion(label="Explore the Sky", action="explore"),
-            Suggestion(label="Open Sky Time Machine", action="timemachine"),
-            Suggestion(label="Citizen Science Quiz", action="learn"),
+            Suggestion(label="Compare Epochs in Time Machine", action="timemachine"),
+            Suggestion(label="Learn Space Discoveries", action="learn"),
         ],
         follow_up_questions=[
-            "What is NASA SPHEREx and what does it measure?",
-            "Why do stars blink and move over time?",
-            "Can you quiz me about this object?",
+            "What is SPHEREx?",
+            "Why does space change over time?",
+            "Can you quiz me about astronomy?",
         ],
         model="astro-knowledge-engine-v2",
     )
@@ -982,16 +1371,29 @@ def generate_fallback_response(message: str, target_id: Optional[str], context: 
 
 async def generate_ai_chat_response(req: ChatRequest) -> ChatResponse:
     """
-    Main entry point for generating AI chat responses.
-    Validates celestial context against verified facts, attempts Claude API via Anthropic SDK,
-    and falls back cleanly with helpful notifications if credentials/network are constrained.
+    Primary handler for POST /api/ai/chat.
+    Tries official Anthropic Claude API if configured with API key.
+    Seamlessly falls back to local astronomical reasoning engine if key is absent or on network errors.
     """
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        try:
+            from dotenv import dotenv_values
+            env_file = Path(__file__).resolve().parent.parent / ".env"
+            if env_file.exists():
+                vals = dotenv_values(env_file)
+                api_key = (vals.get("ANTHROPIC_API_KEY") or "").strip()
+        except Exception:
+            pass
     claude_model = os.getenv("CLAUDE_MODEL", "claude-3-5-sonnet-latest")
 
     # Validate and sanitize context against backend reference catalog
     validated_context = _validate_context(req.target_id, req.context)
     target = _match_target(req.message, req.target_id)
+
+    # If greeting or casual chat, decouple target so it doesn't force unprompted star info
+    if _is_greeting(req.message) or _is_casual(req.message):
+        target = None
 
     if api_key and HAS_ANTHROPIC:
         claude_result = await _call_claude_api(
@@ -1040,10 +1442,10 @@ async def generate_ai_chat_response(req: ChatRequest) -> ChatResponse:
 
         # If Anthropic API had an error (e.g. auth, rate limit, timeout), provide fallback with notice
         err_msg = claude_result.get("error_message", "Anthropic API unavailable.")
-        fallback = generate_fallback_response(req.message, req.target_id, validated_context)
+        fallback = generate_fallback_response(req.message, req.target_id, validated_context, history=req.history)
         fallback.notice = err_msg
         fallback.source = f"Astro AI • Verified Offline Engine ({claude_result.get('error_type', 'offline')})"
         return fallback
 
     # Seamless fallback to intelligent local reasoning engine
-    return generate_fallback_response(req.message, req.target_id, validated_context)
+    return generate_fallback_response(req.message, req.target_id, validated_context, history=req.history)
